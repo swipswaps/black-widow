@@ -1,0 +1,6 @@
+[package]
+name = "black-widow"
+version = "0.1.0"
+authors = ["eater <hello@eaterofco.de>"]
+
+[dependencies]
