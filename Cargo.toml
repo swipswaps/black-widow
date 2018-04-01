@@ -1,6 +1,12 @@
 [package]
+authors = ["eater <hello@eaterofco.de>"]
 name = "black-widow"
 version = "0.1.0"
-authors = ["eater <hello@eaterofco.de>"]
 
 [dependencies]
+docopt = "0.8.3"
+rustc-serialize = "0.3.24"
+tokio = "0.1.4"
+tokio-core = "0.1.16"
+tokio-udp = "0.1.0"
+tun-tap = "0.1.1"

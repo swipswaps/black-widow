@@ -19,3 +19,12 @@ A Meshnet VPN on Layer 2.
 # Execution
 
 Maybe?
+
+# Plan
+
+- [ ] plaintext tunnel protocol
+- [ ] crypto
+- [ ] internal DHT
+- [ ] routing
+- [ ] external DHT
+- [ ] built-in DNS
