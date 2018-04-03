@@ -28,3 +28,7 @@ Maybe?
 - [ ] routing
 - [ ] external DHT
 - [ ] built-in DNS
+
+# Notes
+
+- Working directly on the IP layer isn't a good idea, since port knocking is unpossible, so we're using UDP now
