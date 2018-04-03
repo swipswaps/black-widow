@@ -135,10 +135,10 @@ impl EthernetPacket {
 
     pub fn header_size(&self) -> usize {
         if let Some(_) = self.tag() {
-            return 16;
+            return 18;
         }
 
-        return 12;
+        return 14;
     }
 
     pub fn size(&self) -> usize {
