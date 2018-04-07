@@ -54,11 +54,11 @@ fn main() {
     });
 
     let socket_pipe_in = stream_out.map(|(packet, addr)| {
-        ServerEvent::Packet(packet.to_vec(), addr)
+        ServerEvent::Packet(packet, addr)
     });
 
     let tunnel_pipe_in = tunnel_out.map(|data| {
-        ServerEvent::Tunnel(data)
+        ServerEvent::Tunnel(Bytes::from(data))
     });
 
     let joined_server_sink = socket_pipe_in.select(tunnel_pipe_in).forward(server_in);
