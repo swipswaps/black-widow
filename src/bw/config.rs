@@ -3,7 +3,8 @@ use std::io::prelude::*;
 use std::io;
 
 use bytes::Bytes;
-use toml::Value;
+use toml::value::{Value, Table};
+use uuid::Uuid;
 
 fn read_file(file_path: &str, path: &str) -> Option<Bytes> {
     let file = File::open(file_path);
@@ -52,7 +53,9 @@ fn parse_file_or_value(value: &Value, path: &str, default_is_path: bool) -> Opti
             eprintln!("Need a string with the key 'value' or 'file' for {}", path);
         }
 
-        _ => {}
+        _ => {
+            eprintln!("Need a string or table with the key 'value' or 'file' for {}", path);
+        }
     }
 
     None
@@ -78,18 +81,18 @@ impl Auth {
                     }
                 }
 
-                if let (Some(own_key_val), Some(authority_key_val)) = (table.get("key"), table.get("authority_key")) {
-                    if let (Some(key), Some(authority_key)) = (parse_file_or_value(own_key_val, "auth.key", true), parse_file_or_value(own_key_val, "auth.authority_key", true)) {
+                if let (Some(own_key_val), Some(authority_key_val)) = (table.get("key"), table.get("signature")) {
+                    if let (Some(key), Some(signature)) = (parse_file_or_value(own_key_val, "auth.key", true), parse_file_or_value(own_key_val, "auth.authority_key", true)) {
                         return Some(Auth::Authority(Authority {
                             key,
-                            authority_key,
+                            signature,
                         }));
                     }
                 }
             }
 
             _ => {
-                eprintln!("'auth' key expects an string, or table with the key 'secret' or keys 'authority_key' and 'key'");
+                eprintln!("'auth' key expects an string, or table with the key 'secret' or keys 'signature' and 'key'");
             }
         }
 
@@ -100,37 +103,131 @@ impl Auth {
 #[derive(Debug)]
 pub struct Authority {
     pub key: Bytes,
-    pub authority_key: Bytes,
+    pub signature: Bytes,
+}
+
+#[derive(Debug)]
+pub struct Identity {
+    pub key: Bytes,
+    pub name: Option<String>,
+    pub id: Uuid,
+}
+
+impl Identity {
+    pub fn from_value(value: &Value) -> Option<Identity> {
+        match value {
+            &Value::Table(ref table) => {
+                let mut has_errors = false;
+                let mut key: Bytes = Bytes::new();
+                let mut name: Option<String> = None;
+                let mut id: Uuid = Uuid::new_v4();
+
+                if table.contains_key("key") {
+                    let n = &table["key"];
+
+                    if let Some(b) = parse_file_or_value(n, "identity.key", true) {
+                        key = b;
+                    } else {
+                        has_errors = true;
+                    }
+                } else {
+                    eprintln!("'identity' is missing value 'key'");
+                    has_errors = true;
+                }
+
+                if table.contains_key("name") {
+                    let n = &table["name"];
+
+                    if let &Value::String(ref string) = n {
+                        name = Some(string.clone());
+                    } else {
+                        eprintln!("'identity.name' should be a string, ignoring value");
+                    }
+                }
+
+                if table.contains_key("id") {
+                    let n = &table["id"];
+
+                    if let &Value::String(ref string) = n {
+                        let mut uuid_str = string.clone();
+                        match Uuid::parse_str(&uuid_str) {
+                            Ok(uuid) => {
+                                id = uuid;
+                            }
+
+                            Err(err) => {
+                                eprintln!("'identity.id' failed parsing, invalid uuid");
+                                has_errors = true;
+                            }
+                        }
+                    } else {
+                        eprintln!("'identity.id' should be a string");
+                        has_errors = true;
+                    }
+                } else {
+                    eprintln!("'identity' is missing value 'id'");
+                    has_errors = true;
+                }
+
+                if !has_errors {
+                    return Some(Identity {
+                        name,
+                        key,
+                        id
+                    })
+                }
+            }
+
+            _ => {
+                eprintln!("'identity' key expects an table with keys 'key', 'name' and 'id'");
+            }
+        }
+
+        None
+    }
 }
 
 #[derive(Debug)]
 pub struct Config {
-    pub auth: Auth
+    pub identity: Identity,
+    pub auth: Auth,
 }
 
 impl Config {
     pub fn from_value(value: &Value) -> Option<Config> {
         match value {
             &Value::Table(ref table) => {
-                let mut auth: Auth = Auth::Secret(Bytes::from(b"black-widow".to_vec()));
+                let mut auth: Option<Auth> = None;
+                let mut identity: Option<Identity> = None;
                 let mut has_errors: bool = false;
                 if table.contains_key("auth") {
-                    if let Some(auth_res) = Auth::from_value(table.get("auth").unwrap()) {
-                        auth = auth_res;
+                    if let Some(auth_res) = Auth::from_value(&table["auth"]) {
+                        auth = Some(auth_res);
+                    } else {
+                        has_errors = true;
                     }
                 } else {
                     has_errors = true;
-                    eprintln!("Config is missing 'auth' key")
+                    eprintln!("Config is missing 'auth' key");
                 }
 
-
-                if has_errors {
-                    return None;
+                if table.contains_key("identity") {
+                    if let Some(ident_res) = Identity::from_value(&table["identity"]) {
+                        identity = Some(ident_res);
+                    } else {
+                        has_errors = true;
+                    }
+                } else {
+                    has_errors = true;
+                    eprintln!("Config is missing 'identity' key");
                 }
 
-                return Some(Config {
-                    auth,
-                });
+                if ! has_errors {
+                    return Some(Config {
+                        auth: auth.unwrap(),
+                        identity: identity.unwrap()
+                    });
+                }
             }
 
             _ => {

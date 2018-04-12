@@ -31,11 +31,13 @@ pub struct ConnectionInfo {
     addr: SocketAddr,
     last_update: Instant,
     encryption_state: EncryptionState,
+    public_key: Option<Bytes>,
 }
 
 impl ConnectionInfo {
     pub fn new(addr: SocketAddr) -> ConnectionInfo {
         ConnectionInfo {
+            public_key: None,
             addr,
             last_update: Instant::now(),
             encryption_state: EncryptionState::Null,
@@ -114,14 +116,12 @@ impl Server {
                     let mut conn = connection_info.0.lock().unwrap();
 
                     let mut pub_key_mut: Vec<u8> = vec![0 as u8; key.public_key_len()];
-
                     key.compute_public_key(&mut pub_key_mut).unwrap();
-
                     let pub_key = Bytes::from(pub_key_mut);
 
                     let sign_key: ring::hmac::SigningKey = ring::hmac::SigningKey::new(&ring::digest::SHA512, b"black-widow");
 
-                    let pw = agree_ephemeral(key, &X25519, untrusted::Input::from(&req.public_key[..]), ring::error::Unspecified, |key_material| {
+                    let pw = agree_ephemeral(key, &X25519, untrusted::Input::from(&req.public_key), ring::error::Unspecified, |key_material| {
                         let mut pw: Vec<u8> = vec![0; 64];
                         ring::hkdf::expand(&sign_key, key_material, &mut pw);
 
@@ -129,6 +129,7 @@ impl Server {
                     });
 
                     conn.encryption_state = EncryptionState::Stream(pw.unwrap());
+                    conn.public_key = Some(pub_key.clone());
 
                     let ans = Answer {
                         features: 0,
