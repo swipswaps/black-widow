@@ -31,14 +31,34 @@ use bytes::Bytes;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::fs::File;
 use std::io::prelude::*;
+use std::process::exit;
 
-fn main() {
+fn get_config() -> Option<Config> {
     let mut config = File::open("config/example_secret.toml").unwrap();
     let mut contents = String::new();
 
     config.read_to_string(&mut contents);
 
-    let config: Config = toml::from_str(&contents).unwrap();
+    if let Ok(value) = contents.parse::<toml::Value>() {
+        if let Some(config) = Config::from_value(&value) {
+            return Some(config);
+        } else {
+            eprintln!("Failed to load config");
+            exit(1);
+            return None;
+        }
+    } else {
+        eprintln!("Failed to load config");
+        exit(1);
+        return None;
+    }
+}
+
+fn main() {
+
+    let config = get_config().unwrap();
+
+    println!("Working with config: {:?}", config);
 
     let core = Core::new().unwrap();
     let iface = Iface::new("bw%d", Mode::Tap).unwrap();

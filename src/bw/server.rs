@@ -71,7 +71,7 @@ pub struct Server {
     queue: Vec<ServerEvent>,
     closed: bool,
     connections: Arc<Mutex<HashMap<SocketAddr, MutexConnectionInfo>>>,
-    config: Config
+    config: Config,
 }
 
 impl Server {
@@ -122,13 +122,11 @@ impl Server {
                     let sign_key: ring::hmac::SigningKey = ring::hmac::SigningKey::new(&ring::digest::SHA512, b"black-widow");
 
                     let pw = agree_ephemeral(key, &X25519, untrusted::Input::from(&req.public_key[..]), ring::error::Unspecified, |key_material| {
-                        let mut pw = BytesMut::with_capacity(64);
-                        ring::hkdf::expand(&sign_key, key_material, &mut pw[..]);
+                        let mut pw: Vec<u8> = vec![0; 64];
+                        ring::hkdf::expand(&sign_key, key_material, &mut pw);
 
-                        Ok(pw.freeze())
+                        Ok(Bytes::from(pw))
                     });
-
-                    if
 
                     conn.encryption_state = EncryptionState::Stream(pw.unwrap());
 
