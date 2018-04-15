@@ -18,7 +18,7 @@ Hardcoded for version 1 of the black widow protocol the following algorithms are
 | (EC)DH | X25519 |
 | Signing | Ed25519 |
 | Encryption | ChaCha20 |
-| Hash | HKDF: SHA-512, Packet HMAC: SHA-1 |
+| Hash | HKDF: SHA-512, Shared Secret HMAC: SHA-512, Packet HMAC: SHA-1 |
 
 (*hipster* af.)
 
@@ -49,14 +49,14 @@ This message is used to create a black widow session, this message sent by the i
 | 33 | 32 |  ECDH public key | The ephemeral public key for the ECDH (MUST newly generated for each session) |
 | 65 | 64 | ECDH signature | the signature of the ECDH public key by the peer's public key |
 | 129 | 1 | Auth type | the type of authentication being used, 0 = Authority, 1 = Shared Secret |
-| 130 | 64 | Proof | If auth type is Shared Secret, this is the signature of the shared secret, signed by the ephemeral key used for ECDH, if the auth type is Authority, it's the signature of the peer's public key, signed by the authority.
+| 130 | 64 | Proof | If auth type is Shared Secret, this is the SHA512-HMAC of the ECDH public key, with key used for the HMAC being the shared secret , if the auth type is Authority, it's the signature of the peer's public key, signed by the authority.
 
 The message is silently discarded if it's faulty or corrupted
 
 the ECDHE results in key material on which KDF will be applied with the following parameters:
 
 ```
-SK = HKDF(algo: SHA-512, key: KeyMaterial, info: NetworkId, length: 64 bytes)
+SK = HKDF(algo: SHA-512, key: KeyMaterial, info: NetworkId, length: 64 bytes, salt: [0; 64])
 ```
 
 The secret key (`SK`) is then split in 2, the first 32 bytes will be used as authentication key, the next 32 bytes as encryption key.
@@ -67,8 +67,9 @@ The secret key (`SK`) is then split in 2, the first 32 bytes will be used as aut
 
 Offset | Size | Name | Description
 ---    | ---  | ---  | ---
-0 | 8 | Packet id | 64-bit number indicating the packet id, for each new packet this is increased, at the start of the session it should be a random number, should overflow, but skip 0. MUST never be 0. is also used as IV for the encrypted payload
-8 | *L* - 8 | Payload | the actual encrypted payload, see here: [Encrypted Packet payload (decrypted)](#encrypted-packet-payload--decrypted-)
+0 | 8 | Packet id | 64-bit number indicating the packet id, for each new packet this is increased, at the start of the session it should be a random number, should overflow, but skip 0. MUST never be 0.
+8 | 12 | IV | The IV used for this packet
+20 | *L* - 20 | Payload | the actual encrypted payload, see here: [Encrypted Packet payload (decrypted)](#encrypted-packet-payload--decrypted-)
 
 ### Encrypted Packet payload (decrypted)
 
@@ -91,9 +92,15 @@ Size | From
 4 | UDP 
 1 | Black Widow Prefix
 8 | Black Widow Packet Id
+12 | Black Widow Packet IV
 1 | Black Widow Packet Type
 20 | Black Widow Packet HMAC
 **Total** |
-74 | Total overhead
+86 | Total overhead
   
-This would mean Black Widow should default with an MTU of 1426 
+This would mean Black Widow should default with an MTU of 1414
+
+
+# Credits
+
+Loads of inspiration for the key exchange is taken from [X3DH](https://www.signal.org/docs/specifications/x3dh/) by Moxie Marlinspike and Trevor Perrin.
