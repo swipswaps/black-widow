@@ -1,37 +1,58 @@
 use std::net::SocketAddr;
 use std::io::Error;
-use std::sync::{Mutex, Arc};
+use std::mem;
+use std::u64;
+use std::sync::{Mutex, MutexGuard, Arc};
 use std::time::Instant;
 use std::collections::HashMap;
+
 use tokio::prelude::*;
 use futures::stream::{Stream, SplitStream, SplitSink};
-use bytes::{Bytes, BytesMut};
+use bytes::{Bytes, BytesMut, ByteOrder};
+use byteorder::BigEndian;
 use ring::agreement::{EphemeralPrivateKey, X25519, PUBLIC_KEY_MAX_LEN, agree_ephemeral};
-use ring::rand;
+use ring::rand::{SecureRandom, SystemRandom};
 use ring;
 use untrusted;
 
+
 use super::packet::EthernetPacket;
-use super::protocol::{get_frame_type, KeyExchange, FrameType, Request, Answer};
+use super::protocol::*;
 use super::config::Config;
 
 #[derive(Debug)]
 pub enum ServerEvent {
     Tunnel(Bytes),
     Packet(Bytes, SocketAddr),
+    Control(String),
 }
 
-pub enum EncryptionState {
+pub enum ConnectionState {
     Null,
-    DH(EphemeralPrivateKey, Bytes),
-    Stream(Bytes),
+    KeyExchange(EphemeralPrivateKey),
+    Stream(EncryptionParameters),
+}
+
+impl ConnectionState {
+    pub fn is_null(&self) -> bool {
+        match *self {
+            ConnectionState::Null => {
+                true
+            }
+
+            _ => {
+                false
+            }
+        }
+    }
 }
 
 pub struct ConnectionInfo {
     addr: SocketAddr,
     last_update: Instant,
-    encryption_state: EncryptionState,
+    connection_state: ConnectionState,
     public_key: Option<Bytes>,
+    packet_id: u64,
 }
 
 impl ConnectionInfo {
@@ -40,7 +61,8 @@ impl ConnectionInfo {
             public_key: None,
             addr,
             last_update: Instant::now(),
-            encryption_state: EncryptionState::Null,
+            connection_state: ConnectionState::Null,
+            packet_id: 0,
         }
     }
 
@@ -48,8 +70,26 @@ impl ConnectionInfo {
         self.last_update = Instant::now();
     }
 
-    pub fn is_expired(&self) {
-        Instant::now().duration_since(self.last_update).as_secs() > 60;
+    pub fn next_packet_id(&mut self) -> u64 {
+        if self.packet_id == 0 {
+            let mut x = vec![0u8; 8];
+            SystemRandom::new().fill(&mut x);
+
+            self.packet_id = BigEndian::read_u64(&x);
+        }
+
+        self.packet_id = self.packet_id.overflowing_add(1).0;
+
+        // Should never been 0
+        if self.packet_id == 0 {
+            self.packet_id = 1;
+        }
+
+        self.packet_id
+    }
+
+    pub fn is_expired(&self) -> bool {
+        Instant::now().duration_since(self.last_update).as_secs() > 60
     }
 }
 
@@ -59,13 +99,17 @@ struct MutexConnectionInfo(Arc<Mutex<ConnectionInfo>>);
 impl MutexConnectionInfo {
     pub fn new(addr: SocketAddr) -> MutexConnectionInfo {
         let info = ConnectionInfo::new(addr);
+        return MutexConnectionInfo::wrap(info);
+    }
 
+    pub fn wrap(info: ConnectionInfo) -> MutexConnectionInfo {
         return MutexConnectionInfo(Arc::new(Mutex::new(info)));
     }
 
+    fn get_mutex(&self) -> MutexGuard<ConnectionInfo> { self.0.lock().unwrap() }
+
     pub fn bump(&self) {
-        let mut item = self.0.lock().unwrap();
-        item.bump();
+        self.get_mutex().bump();
     }
 }
 
@@ -90,67 +134,116 @@ impl Server {
         self.queue.push(event)
     }
 
-    fn on_tunnel(&mut self, data: Bytes) {}
+    fn on_tunnel(&mut self, data: Bytes) {
+        let mut events = vec![];
+        {
+            let x = self.connections.lock().unwrap();
+            let message = Message::new(1, data.clone());
 
-    fn on_dht_krpc(&self, data: Bytes) {
-        // TODO
-    }
+            for (addr, state) in x.iter() {
+                let mut mutex = state.get_mutex();
+                if !mutex.is_expired() {
+                    let next_id = mutex.next_packet_id();
 
-    fn on_message(&mut self, data: Bytes, connection_info: MutexConnectionInfo) {
-        connection_info.bump();
-        println!("Got message with identifier '{:?}'", data[0]);
+                    if let ConnectionState::Stream(ref paramaters) = mutex.connection_state {
+                        let encrypted_message = EncryptedMessage::new_from_message(next_id, &message, paramaters);
 
-        match get_frame_type(data.slice(0, 1)) {
-            FrameType::KeyExchange => self.handle_key_exchange(data, connection_info),
-            _ => {}
+                        if let Some(bytes) = Packet::EncryptedMessage(encrypted_message).get_bytes() {
+                            events.push(ServerEvent::Packet(bytes, addr.clone()));
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+            }
+        }
+
+        for event in events {
+            self.queue_event(event);
         }
     }
 
-    fn handle_key_exchange(&mut self, data: Bytes, connection_info: MutexConnectionInfo) {
-        let message = KeyExchange::from_bytes(data.slice_from(1));
-        println!("KeyExchange: {:?}", message);
+    fn on_dht_krpc(&self, data: Bytes, addr: SocketAddr) {
+        // TODO
+    }
 
-        match message {
-            Some(KeyExchange::Request(req)) => {
-                if let Ok(key) = EphemeralPrivateKey::generate(&X25519, &rand::SystemRandom::new()) {
-                    let mut conn = connection_info.0.lock().unwrap();
+    fn handle_message(&mut self, message: Message, connection_info: MutexConnectionInfo) {
+        if message.message_type == 1 {
+            self.queue_event(ServerEvent::Tunnel(message.payload));
+        }
+    }
 
-                    let mut pub_key_mut: Vec<u8> = vec![0 as u8; key.public_key_len()];
-                    key.compute_public_key(&mut pub_key_mut).unwrap();
-                    let pub_key = Bytes::from(pub_key_mut);
+    fn on_message(&mut self, encrypted_message: EncryptedMessage, connection_info: MutexConnectionInfo) {
+        let mut parameters: Option<EncryptionParameters> = None;
 
-                    let sign_key: ring::hmac::SigningKey = ring::hmac::SigningKey::new(&ring::digest::SHA512, b"black-widow");
+        {
+            let info = connection_info.get_mutex();
+            if let ConnectionState::Stream(ref para) = info.connection_state {
+                parameters = Some(para.clone());
+            }
+        }
 
-                    let pw = agree_ephemeral(key, &X25519, untrusted::Input::from(&req.public_key), ring::error::Unspecified, |key_material| {
-                        let mut pw: Vec<u8> = vec![0; 64];
-                        ring::hkdf::expand(&sign_key, key_material, &mut pw);
+        if let Some(parameters) = parameters {
+            let message = encrypted_message.decrypt(&parameters);
+            if message.is_none() {
+                return;
+            }
 
-                        Ok(Bytes::from(pw))
-                    });
+            let message = message.unwrap();
+            if !message.verify(&parameters) {
+                return;
+            }
 
-                    conn.encryption_state = EncryptionState::Stream(pw.unwrap());
-                    conn.public_key = Some(pub_key.clone());
+            {
+                let mut info = connection_info.get_mutex();
+                info.bump();
+            }
 
-                    let ans = Answer {
-                        features: 0,
-                        version: 0,
-                        proof: Bytes::new(),
-                        secret: Bytes::new(),
-                        public_key: pub_key.clone(),
-                    };
 
-                    let mut out = vec![0; 1000];
+            self.handle_message(message, connection_info);
+        }
+    }
 
-                    let size = ans.to_bytes(&mut out);
+    fn handle_key_exchange(&mut self, key_exchange: KeyExchange, connection_info: MutexConnectionInfo) {
+        if !key_exchange.verify(&self.config) {
+            return;
+        }
 
-                    let out = Bytes::from(&out[..size]);
+        connection_info.bump();
 
-                    self.queue_event(ServerEvent::Packet(out, conn.addr));
-                } else {
-                    println!("Failed generating ECDH key");
+        let mut info = connection_info.get_mutex();
+
+        let state = mem::replace(&mut info.connection_state, ConnectionState::Null);
+
+        match state {
+            ConnectionState::KeyExchange(key) => {
+                match key_exchange.derive_encryption_parameters(key, &self.config) {
+                    None => {
+                        info.connection_state = ConnectionState::Null;
+                    }
+
+                    Some(paramaters) => {
+                        info.connection_state = ConnectionState::Stream(paramaters)
+                    }
                 }
             }
-            _ => {}
+
+            _ => {
+                if let Ok((exchange, key)) = KeyExchange::new_key_exchange(&self.config) {
+                    if let Some(parameters) = key_exchange.derive_encryption_parameters(key, &self.config) {
+                        if let Some(bytes) = Packet::KeyExchange(exchange).get_bytes() {
+                            info.connection_state = ConnectionState::Stream(parameters);
+                            self.queue_event(ServerEvent::Packet(bytes, info.addr.clone()));
+                        } else {
+                            info.connection_state = ConnectionState::Null;
+                        }
+                    } else {
+                        info.connection_state = ConnectionState::Null;
+                    }
+                } else {
+                    info.connection_state = ConnectionState::Null;
+                }
+            }
         }
     }
 
@@ -172,15 +265,25 @@ impl Server {
     }
 
     fn on_packet(&mut self, data: Bytes, addr: SocketAddr) {
-        match get_frame_type(data.slice(0, 1)) {
-            FrameType::MainlineDHT => self.on_dht_krpc(data),
-            _ => {
+        match Packet::from_bytes(data) {
+            Some(Packet::MainlineDHT(data)) => {
+                self.on_dht_krpc(data, addr);
+            }
+
+            Some(Packet::KeyExchange(key_exchange)) => {
+
                 if let Some(connection_info) = self.get_connection_info(addr) {
-                    self.on_message(data, connection_info);
-                } else {
-                    println!("Unable to fetch connection info for {:?}", addr);
+                    self.handle_key_exchange(key_exchange, connection_info);
                 }
             }
+
+            Some(Packet::EncryptedMessage(encrypted_message)) => {
+                if let Some(connection_info) = self.get_connection_info(addr) {
+                    self.on_message(encrypted_message, connection_info);
+                }
+            }
+
+            _ => {}
         }
     }
 
@@ -190,6 +293,44 @@ impl Server {
         match event {
             ServerEvent::Tunnel(data) => self.on_tunnel(data),
             ServerEvent::Packet(data, addr) => self.on_packet(data, addr),
+            ServerEvent::Control(data) => self.on_control(data),
+        }
+    }
+
+    fn on_control(&mut self, data: String) {
+        if data.starts_with("connect ") {
+            let try = data[8..].trim();
+
+            if let Ok(x) = try.parse::<SocketAddr>() {
+                self.connect(x);
+                self.queue_event(ServerEvent::Control(String::from("Ok\n")));
+            } else {
+                self.queue_event(ServerEvent::Control(String::from("No\n")));
+            }
+        }
+    }
+
+    pub fn connect(&mut self, addr: SocketAddr) {
+        {
+            let connections = self.connections.lock().unwrap();
+            if connections.contains_key(&addr) && connections[&addr].get_mutex().connection_state.is_null() {
+                return;
+            }
+        }
+
+        if let Ok((exchange, key)) = KeyExchange::new_key_exchange(&self.config) {
+            let mut info = ConnectionInfo::new(addr.clone());
+
+            info.connection_state = ConnectionState::KeyExchange(key);
+
+            if let Some(bytes) = Packet::KeyExchange(exchange).get_bytes() {
+                self.queue_event(ServerEvent::Packet(bytes, addr.clone()));
+            } else {
+                return;
+            }
+
+            let mut conns = self.connections.lock().unwrap();
+            conns.insert(addr, MutexConnectionInfo::wrap(info));
         }
     }
 }

@@ -1,154 +1,586 @@
-use byteorder::{BigEndian, ReadBytesExt};
-use bytes::{Bytes, ByteOrder};
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use bytes::{Bytes, ByteOrder, BufMut, BytesMut};
 
-pub enum FrameType {
-    MainlineDHT,
-    KeyExchange,
-    CipherText,
+use ring::rand::{SecureRandom, SystemRandom};
+use ring::signature::{VerificationAlgorithm, ED25519, Ed25519KeyPair};
+use ring::agreement::{X25519, agree_ephemeral, EphemeralPrivateKey};
+use ring::hkdf::extract_and_expand;
+use ring::hmac::{SigningKey, sign, verify_with_own_key};
+use ring::digest::{SHA512, SHA1};
+use ring::error::Unspecified;
+use untrusted::Input;
+use super::config::{Config, Auth};
+
+use std::io::prelude::*;
+use std::io::Cursor;
+
+use crypto::chacha20::ChaCha20;
+use crypto::symmetriccipher::SynchronousStreamCipher;
+
+#[derive(Clone, Debug)]
+pub struct EncryptionParameters {
+    authentication_key: Bytes,
+    encryption_key: Bytes,
 }
 
-pub fn get_frame_type(data: Bytes) -> FrameType {
-    match data[0] {
-        100 => FrameType::MainlineDHT,
-        101 => FrameType::KeyExchange,
-        _ => FrameType::CipherText
+impl EncryptionParameters {
+    pub fn signing_key(&self) -> SigningKey {
+        SigningKey::new(&SHA1, &self.authentication_key)
+    }
+
+    pub fn from_bytes(data: Bytes) -> Option<EncryptionParameters> {
+        if data.len() < 64 {
+            return None;
+        }
+
+        return Some(EncryptionParameters {
+            authentication_key: data.slice(0, 32),
+            encryption_key: data.slice(32, 64),
+        });
     }
 }
 
-pub enum Message {
-    EthernetFrame(Bytes),
-    RPC(RPC),
+pub enum Packet {
+    MainlineDHT(Bytes),
+    KeyExchange(KeyExchange),
+    EncryptedMessage(EncryptedMessage),
 }
 
+macro_rules! verify_ed25519 {
+    ($key:expr, $msg:expr, $signature:expr) => {
+        let algo = &ED25519;
+        if let Err(_) = algo.verify(Input::from($key), Input::from($msg), Input::from($signature)) {
+             return false
+        }
+    };
+}
 
-impl Message {
-    pub fn from_bytes(data: Bytes) -> Option<Message> {
+impl Packet {
+    pub fn from_bytes(data: Bytes) -> Option<Packet> {
+        if data.len() < 1 {
+            return None;
+        }
+
+        let payload = data.slice_from(1);
+
+        let res = Packet::get_frame_type(data[0]);
+
+        match res {
+            Some(PacketType::EncryptedMessage) => {
+                if let Some(message) = EncryptedMessage::from_bytes(payload) {
+                    Some(Packet::EncryptedMessage(message))
+                } else {
+                    None
+                }
+            }
+
+            Some(PacketType::KeyExchange) => {
+                println!("Trying to create key exchange from: {:?}", payload);
+                if let Some(key_exchange) = KeyExchange::from_bytes(payload) {
+                    Some(Packet::KeyExchange(key_exchange))
+                } else {
+                    None
+                }
+            }
+
+            Some(PacketType::MainlineDHT) => {
+                Some(Packet::MainlineDHT(data))
+            }
+
+            // Is actually only None
+            _ => None,
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        match *self {
+            Packet::KeyExchange(ref key_exchange) => key_exchange.size() + 1,
+            Packet::EncryptedMessage(ref encrypted_message) => encrypted_message.size() + 1,
+            Packet::MainlineDHT(ref bytes) => bytes.len()
+        }
+    }
+
+    pub fn get_bytes(&self) -> Option<Bytes> {
+        let mut out = BytesMut::with_capacity(self.size());
+        unsafe {
+            out.set_len(self.size())
+        }
+
+        if let Some(_) = self.to_bytes(&mut out) {
+            return Some(out.freeze());
+        }
+
         None
     }
-}
 
-pub enum RPC {}
+    pub fn to_bytes(&self, out: &mut [u8]) -> Option<usize> {
+        if self.size() > out.len() {
+            return None;
+        }
 
-#[derive(Debug, Clone)]
-pub enum KeyExchange {
-    Request(Request),
-    Answer(Answer),
-}
+        match *self {
+            Packet::KeyExchange(ref key_exchange) => {
+                out[0] = 101;
+                if let Some(written) = key_exchange.to_bytes(&mut out[1..]) {
+                    return Some(written + 1);
+                }
+            }
 
-impl KeyExchange {
-    pub fn from_bytes(data: Bytes) -> Option<KeyExchange> {
-        match data[0] {
-            0 => Some(KeyExchange::Request(Request::from_bytes(data.slice_from(1)))),
-            1 => Some(KeyExchange::Answer(Answer::from_bytes(data.slice_from(1)))),
+            Packet::EncryptedMessage(ref encrypted_message) => {
+                out[0] = 99;
+                if let Some(written) = encrypted_message.to_bytes(&mut out[1..]) {
+                    return Some(written + 1);
+                }
+            }
+
+            Packet::MainlineDHT(ref data) => {
+                out[..data.len()].copy_from_slice(&data);
+            }
+        }
+
+        None
+    }
+
+    pub fn get_frame_type(identifier: u8) -> Option<PacketType> {
+        match identifier {
+            99 => Some(PacketType::EncryptedMessage),
+            100 => Some(PacketType::MainlineDHT),
+            101 => Some(PacketType::KeyExchange),
             _ => None,
         }
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Answer {
-    pub public_key: Bytes,
-    pub secret: Bytes,
-    pub proof: Bytes,
-    pub version: u8,
-    pub features: u64,
+#[derive(Debug, PartialOrd, PartialEq)]
+pub enum PacketType {
+    MainlineDHT,
+    KeyExchange,
+    EncryptedMessage,
 }
 
 
-impl Answer {
-    pub fn from_bytes(data: Bytes) -> Answer {
-        let pubkey_len = BigEndian::read_u16(&data[0..2]);
-        let mut offset: usize = 2;
-        let public_key = data.slice(offset, offset + pubkey_len as usize);
-        offset += pubkey_len as usize;
+fn chacha20(key: &[u8], iv: &[u8], cipher_text: &[u8]) -> Bytes {
+    let mut chacha = ChaCha20::new(key, iv);
+    let mut output = BytesMut::with_capacity(cipher_text.len());
+    unsafe {
+        output.set_len(cipher_text.len());
+    }
 
-        let secret_len = BigEndian::read_u16(&data[offset..offset + 2]);
-        offset += 2;
-        let secret = data.slice(offset, offset + secret_len as usize);
-        offset += secret_len as usize;
+    chacha.process(&cipher_text, &mut output);
 
-        let proof_len = BigEndian::read_u16(&data[offset..offset + 2]);
-        offset += 2;
-        let proof = data.slice(offset, offset + proof_len as usize);
-        offset += proof_len as usize;
+    return output.freeze();
+}
 
-        let version = data[offset];
-        offset += 1;
+#[derive(Debug)]
+pub struct EncryptedMessage {
+    pub packet_id: u64,
+    pub iv: Bytes,
+    pub cipher_text: Bytes,
+}
 
-        let features = BigEndian::read_u64(&data[offset..offset + 8]);
+impl EncryptedMessage {
+    pub fn from_bytes(data: Bytes) -> Option<EncryptedMessage> {
+        if data.len() < 45 {
+            return None;
+        }
 
-        Answer {
-            public_key,
-            secret,
-            proof,
-            version,
-            features,
+        Some(EncryptedMessage {
+            packet_id: BigEndian::read_u64(&data[0..8]),
+            iv: data.slice(8, 20),
+            cipher_text: data.slice_from(20),
+        })
+    }
+
+    pub fn new_from_message(packet_id: u64, message: &Message, parameters: &EncryptionParameters) -> EncryptedMessage {
+        let mut iv = vec![0; 12];
+        SystemRandom::new().fill(&mut iv);
+
+        let mut message_clone = message.clone();
+        message_clone.sign(parameters);
+
+        let mut plain_text = vec![0u8; message_clone.size()];
+        message_clone.to_bytes(&mut plain_text);
+        let cipher_text = chacha20(&parameters.encryption_key, &iv, &plain_text);
+
+        EncryptedMessage {
+            iv: Bytes::from(iv),
+            cipher_text,
+            packet_id,
         }
     }
 
-    pub fn to_bytes(&self, out: &mut [u8]) -> usize {
-        let mut offset: usize = 0;
+    pub fn decrypt(&self, parameters: &EncryptionParameters) -> Option<Message> {
+        Message::from_bytes(
+            chacha20(
+                &parameters.encryption_key,
+                &self.iv,
+                &self.cipher_text,
+            )
+        )
+    }
 
-        BigEndian::write_u16(&mut out[0..2], self.public_key.len() as u16);
-        offset += 2;
+    pub fn size(&self) -> usize { 20 + self.cipher_text.len() }
 
-        out[offset..offset+self.public_key.len()].copy_from_slice(&self.public_key);
-        offset += self.public_key.len();
+    pub fn to_bytes(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < self.size() {
+            return None;
+        }
 
-        BigEndian::write_u16(&mut out[offset .. offset + 2], 0);
-        offset += 2;
+        let mut cursor = Cursor::new(out);
+        cursor.write_u64::<BigEndian>(self.packet_id);
+        cursor.write(&self.iv);
+        cursor.write(&self.cipher_text);
 
-        BigEndian::write_u16(&mut out[offset .. offset + 2], 0);
-        offset += 2;
-
-        out[offset] = 0;
-        offset += 1;
-
-        BigEndian::write_u64(&mut out[offset .. offset + 8], 0);
-        offset += 8;
-
-        return offset;
+        Some(cursor.position() as usize)
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Request {
-    pub public_key: Bytes,
-    pub proof: Option<Bytes>,
-    pub versions: Vec<u8>,
-    pub features: u64,
+#[derive(Clone, Debug)]
+pub struct Message {
+    pub compressed: bool,
+    pub message_type: u8,
+    pub payload: Bytes,
+    pub hmac: Bytes,
 }
 
-impl Request {
-    pub fn from_bytes(data: Bytes) -> Request {
-        let pubkey_len = BigEndian::read_u16(&data[0..2]);
-        println!("pubkey_len: {:?}", pubkey_len);
-        let mut offset: usize = 2;
-        let public_key = data.slice(offset, pubkey_len as usize + offset);
-        offset += pubkey_len as usize;
-        let proof_len = BigEndian::read_u16(&data[offset..offset + 2]);
-        offset += 2;
+impl Message {
+    pub fn new(message_type: u8, payload: Bytes) -> Message {
+        Message {
+            compressed: false,
+            message_type,
+            payload,
+            hmac: Bytes::new(),
+        }
+    }
 
-        let proof = match proof_len {
-            0 => None,
-            _ => Some(data.slice(offset, offset + proof_len as usize)),
+    pub fn from_bytes(data: Bytes) -> Option<Message> {
+        let hmac_start = data.len() - 20;
+        let hmac = data.slice_from(hmac_start);
+        let payload = data.slice(1, hmac_start);
+
+        Some(Message {
+            compressed: (data[0] & 128) == 128,
+            message_type: (data[0] & 127),
+            payload,
+            hmac,
+        })
+    }
+
+    pub fn verify(&self, parameters: &EncryptionParameters) -> bool {
+        if let Err(_) = verify_with_own_key(&parameters.signing_key(), &self.payload, &self.hmac) {
+            return false;
+        }
+
+        true
+    }
+
+    pub fn size(&self) -> usize {
+        return 21 + self.payload.len();
+    }
+
+    pub fn sign(&mut self, parameters: &EncryptionParameters) {
+        self.hmac = Bytes::from(sign(&parameters.signing_key(), &self.payload).as_ref());
+    }
+
+    pub fn to_bytes(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < self.size() {
+            return None;
+        }
+
+        let mut cursor = Cursor::new(out);
+        cursor.write_u8({ if self.compressed { 128 } else { 0 } } + (self.message_type & 127));
+        cursor.write(&self.payload);
+        cursor.write(&self.hmac);
+
+        Some(cursor.position() as usize)
+    }
+}
+
+#[derive(Debug, Clone, PartialOrd, PartialEq)]
+pub enum KeyExchangeAuthType {
+    SharedSecret,
+    Authority,
+}
+
+#[derive(Debug, Clone)]
+pub struct KeyExchange {
+    pub version: u8,
+    pub public_key: Bytes,
+    pub ephemeral_key: Bytes,
+    pub ephemeral_signature: Bytes,
+    pub auth_type: KeyExchangeAuthType,
+    pub proof: Bytes,
+}
+
+impl KeyExchange {
+    pub fn size(&self) -> usize {
+        194
+    }
+
+    pub fn from_bytes(data: Bytes) -> Option<KeyExchange> {
+        if data.len() < 194 || data[0] != 1 || data[129] > 1 {
+            return None;
+        }
+
+        Some(KeyExchange {
+            version: data[0],
+            public_key: data.slice(1, 33),
+            ephemeral_key: data.slice(33, 65),
+            ephemeral_signature: data.slice(65, 129),
+            auth_type: {
+                if data[129] == 1 {
+                    KeyExchangeAuthType::SharedSecret
+                } else {
+                    KeyExchangeAuthType::Authority
+                }
+            },
+            proof: data.slice(130, 194),
+        })
+    }
+
+    pub fn verify_lengths(&self) -> bool {
+        if self.public_key.len() != 32 {
+            return false;
+        }
+
+        if self.ephemeral_key.len() != 32 {
+            return false;
+        }
+
+        if self.ephemeral_signature.len() != 64 {
+            return false;
+        }
+
+        if self.proof.len() != 64 {
+            return false;
+        }
+
+        true
+    }
+
+    pub fn to_bytes(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < 194 || !self.verify_lengths() {
+            return None;
+        }
+
+        let mut cursor = Cursor::new(out);
+
+        cursor.write_u8(self.version);
+        cursor.write(&self.public_key);
+        cursor.write(&self.ephemeral_key);
+        cursor.write(&self.ephemeral_signature);
+        cursor.write_u8({
+            if self.auth_type == KeyExchangeAuthType::SharedSecret {
+                1
+            } else {
+                0
+            }
+        });
+        cursor.write(&self.proof);
+
+        Some(194)
+    }
+
+    pub fn verify(&self, config: &Config) -> bool {
+        if self.version != 1 {
+            return false;
+        }
+
+        verify_ed25519!(&self.public_key, &self.ephemeral_key, &self.ephemeral_signature);
+
+        match &config.auth {
+            &Auth::Authority(ref authority) => {
+                if self.auth_type != KeyExchangeAuthType::Authority {
+                    return false;
+                }
+
+                verify_ed25519!(&authority.key, &self.public_key, &self.proof);
+            }
+
+            &Auth::SharedSecret(ref secret) => {
+                if self.auth_type != KeyExchangeAuthType::SharedSecret {
+                    return false;
+                }
+
+                if let Err(_) = verify_with_own_key(&secret.signing_key, &self.ephemeral_key, &self.proof) {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    pub fn derive_encryption_parameters(&self, ephemeral_key: EphemeralPrivateKey, config: &Config) -> Option<EncryptionParameters> {
+        let mut out: Vec<u8> = vec![0; 64];
+
+        if let Err(_) = agree_ephemeral(
+            ephemeral_key,
+            &X25519,
+            Input::from(&self.ephemeral_key),
+            Unspecified,
+            |key_material| {
+                extract_and_expand(&SigningKey::new(&SHA512, &[0; 64]), key_material, &config.network.id, &mut out);
+
+                Ok(())
+            },
+        ) {
+            return None;
+        }
+
+        return Some(EncryptionParameters {
+            authentication_key: Bytes::from(&out[..32]),
+            encryption_key: Bytes::from(&out[32..64]),
+        });
+    }
+
+    pub fn new_key_exchange(config: &Config) -> Result<(KeyExchange, EphemeralPrivateKey), Unspecified> {
+        let ephemeral_key = EphemeralPrivateKey::generate(&X25519, &SystemRandom::new())?;
+        let mut ephemeral_public_key = vec![0; 32];
+        ephemeral_key.compute_public_key(&mut ephemeral_public_key);
+        let ephemeral_public_key = Bytes::from(ephemeral_public_key);
+
+        Ok((
+            KeyExchange {
+                version: 1,
+                public_key: config.identity.public_key.clone(),
+                ephemeral_key: ephemeral_public_key.clone(),
+                ephemeral_signature: config.identity.sign(&ephemeral_public_key),
+                auth_type: {
+                    if config.auth.is_shared_secret() {
+                        KeyExchangeAuthType::SharedSecret
+                    } else {
+                        KeyExchangeAuthType::Authority
+                    }
+                },
+                proof: {
+                    match &config.auth {
+                        &Auth::SharedSecret(ref secret) => {
+                            Bytes::from(sign(&secret.signing_key, &ephemeral_public_key).as_ref())
+                        }
+
+                        &Auth::Authority(ref auth) => {
+                            auth.signature.clone()
+                        }
+                    }
+                },
+            },
+            ephemeral_key,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_shared_secret_key_exchange() {
+        let config = Config::from_value(&toml!(
+        [network]
+        code = "secret society"
+
+        [auth]
+        secret = { value = "YiiBoi2018" }
+
+        [identity]
+        key = { value = "12345678901234567890123456789012" }
+        name = "Starving Califlower"
+    )).unwrap();
+
+        let message = KeyExchange::new_key_exchange(&config);
+        assert!(message.is_ok());
+        let (message, _) = message.unwrap();
+
+
+        assert!(message.verify(&config));
+        let mut compiled_message: Vec<u8> = vec![0; 194];
+        assert_eq!(message.to_bytes(&mut compiled_message), Some(194));
+        let parsed_message = KeyExchange::from_bytes(Bytes::from(compiled_message));
+        assert!(parsed_message.is_some());
+        let parsed_message = parsed_message.unwrap();
+        assert!(parsed_message.verify(&config));
+    }
+
+    #[test]
+    fn test_authority_key_exchange() {
+        let config = Config::from_value(&toml!(
+        [network]
+        code = "secret society"
+
+        [auth]
+        key = { value = "generated by code" }
+        signature = { value = "generated by code" }
+
+        [identity]
+        key = { value = "12345678901234567890123456789012" }
+        name = "Starving Califlower"
+    ));
+
+        if let Err(errs) = config {
+            println!("Failed: {:?}", errs);
+            assert!(false);
+            return;
+        }
+
+        let mut config = config.unwrap();
+
+        if let Auth::Authority(ref mut auth) = config.auth {
+            let mut authority = vec![0; 32];
+            SystemRandom::new().fill(&mut authority);
+            let authority = Bytes::from(authority);
+
+            let key_pair = Ed25519KeyPair::from_seed_unchecked(Input::from(&authority));
+            assert!(key_pair.is_ok());
+            let key_pair = key_pair.unwrap();
+
+            auth.signature = Bytes::from(key_pair.sign(&config.identity.public_key).as_ref());
+            auth.key = Bytes::from(key_pair.public_key_bytes());
+        } else {
+            assert!(false);
+        }
+
+        let config = config;
+
+        let message = KeyExchange::new_key_exchange(&config);
+        assert!(message.is_ok());
+        let (message, _) = message.unwrap();
+
+        assert_eq!(&message.public_key, &config.identity.public_key);
+
+        assert!(message.verify(&config));
+        let mut compiled_message: Vec<u8> = vec![0; 194];
+        assert_eq!(message.to_bytes(&mut compiled_message), Some(194));
+        let parsed_message = KeyExchange::from_bytes(Bytes::from(compiled_message));
+        assert!(parsed_message.is_some());
+        let parsed_message = parsed_message.unwrap();
+        assert!(parsed_message.verify(&config));
+    }
+
+    #[test]
+    fn test_message() {
+        let mut all = vec![0; 64];
+        SystemRandom::new().fill(&mut all);
+
+        let parameters = EncryptionParameters::from_bytes(Bytes::from(all));
+
+        assert!(parameters.is_some());
+        let parameters = parameters.unwrap();
+
+        let mut message = Message {
+            compressed: false,
+            message_type: 1,
+            payload: Bytes::from(b"Hello world!".to_vec()),
+            hmac: Bytes::new(),
         };
 
-        offset += proof_len as usize;
+        let encrypted = EncryptedMessage::new_from_message(1, &message, &parameters);
 
-        let versions_len: u8 = data[offset];
-        offset += 1;
+        let new_message = encrypted.decrypt(&parameters);
+        assert!(new_message.is_some());
+        let new_message = new_message.unwrap();
 
-        let versions = (&data[offset..offset + versions_len as usize]).to_vec();
-        offset += versions_len as usize;
-
-        let features = BigEndian::read_u64(&data[offset..offset + 8]);
-
-        Request {
-            public_key,
-            proof,
-            versions,
-            features,
-        }
+        assert_eq!(&new_message.payload, &message.payload);
+        assert!(new_message.verify(&parameters));
     }
 }

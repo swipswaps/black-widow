@@ -1,89 +1,137 @@
 use std::fs::File;
 use std::io::prelude::*;
 use std::io;
+use std::ascii::AsciiExt;
+
+use std::fmt::{Debug, Formatter};
+use std::fmt;
 
 use bytes::Bytes;
 use toml::value::{Value, Table};
 use uuid::Uuid;
 
-fn read_file(file_path: &str, path: &str) -> Option<Bytes> {
+use untrusted::Input;
+
+use ring::digest;
+use ring::hmac::SigningKey;
+use ring::signature::{Ed25519KeyPair, ED25519};
+
+
+fn read_file(file_path: &str, path: &str) -> Result<Bytes, Vec<String>> {
+    let mut error_vec = vec![];
+
     let file = File::open(file_path);
 
     if file.is_err() {
-        eprintln!("Couldn't open file '{}' for {}", file_path, path);
+        error_vec.push(String::from(format!("Couldn't open file '{}' for {}", file_path, path)));
 
-        return None;
+        return Err(error_vec);
     }
 
     let mut file = file.unwrap();
-
     let mut data: Vec<u8> = vec![0; 1024];
     let size = file.read(&mut data);
 
     if size.is_err() {
-        eprintln!("Couldn't open file '{}' for {}", file_path, path);
+        error_vec.push(String::from(format!("Couldn't open file '{}' for {}", file_path, path)));
 
-        return None;
+        return Err(error_vec);
     }
 
     let size = size.unwrap();
 
-    Some(Bytes::from(&data[..size]))
+    Ok(Bytes::from(&data[..size]))
 }
 
-fn parse_file_or_value(value: &Value, path: &str, default_is_path: bool) -> Option<Bytes> {
+fn parse_file_or_value(value: &Value, path: &str, default_is_path: bool) -> Result<Bytes, Vec<String>> {
+    let mut error_vec = vec![];
+
     match value {
         &Value::String(ref string) => {
             if default_is_path {
                 return read_file(&string, path);
             } else {
-                return Some(Bytes::from(string.as_bytes()));
+                return Ok(Bytes::from(string.as_bytes()));
             }
         }
 
         &Value::Table(ref table) => {
             if let Some(&Value::String(ref value)) = table.get("value") {
-                return Some(Bytes::from(value.as_bytes()));
+                return Ok(Bytes::from(value.as_bytes()));
             }
 
             if let Some(&Value::String(ref file)) = table.get("file") {
                 return read_file(&file, path);
             }
 
-            eprintln!("Need a string with the key 'value' or 'file' for {}", path);
+            error_vec.push(String::from(format!("Need a string with the key 'value' or 'file' in {}", path)));
         }
 
         _ => {
-            eprintln!("Need a string or table with the key 'value' or 'file' for {}", path);
+            error_vec.push(String::from(format!("Need a string or table with the key 'value' or 'file' for {}", path)));
         }
     }
 
-    None
+    Err(error_vec)
 }
 
 #[derive(Debug)]
 pub enum Auth {
-    Secret(Bytes),
+    SharedSecret(SharedSecret),
     Authority(Authority),
 }
 
 impl Auth {
-    pub fn from_value(value: &Value) -> Option<Auth> {
+    pub fn from_value(value: &Value) -> Result<Auth, Vec<String>> {
+        let mut error_vec: Vec<String> = vec![];
+
         match value {
             &Value::String(ref string) => {
-                return Some(Auth::Secret(Bytes::from(string.as_bytes())));
+                return Ok(Auth::SharedSecret(SharedSecret::new(Bytes::from(string.as_bytes()))));
             }
 
             &Value::Table(ref table) => {
                 if let Some(secret) = table.get("secret") {
-                    if let Some(bytes) = parse_file_or_value(secret, "auth.secret", false) {
-                        return Some(Auth::Secret(bytes));
+                    match parse_file_or_value(secret, "auth.secret", false) {
+                        Err(err) => {
+                            return Err(err);
+                        }
+
+                        Ok(bytes) => {
+                            return Ok(Auth::SharedSecret(SharedSecret::new(bytes)));
+                        }
                     }
                 }
 
-                if let (Some(own_key_val), Some(authority_key_val)) = (table.get("key"), table.get("signature")) {
-                    if let (Some(key), Some(signature)) = (parse_file_or_value(own_key_val, "auth.key", true), parse_file_or_value(own_key_val, "auth.authority_key", true)) {
-                        return Some(Auth::Authority(Authority {
+                if table.contains_key("key") && table.contains_key("signature") {
+                    let key_result = parse_file_or_value(&table["key"], "auth.key", true);
+                    let signature_result = parse_file_or_value(&table["signature"], "auth.signature", true);
+
+                    if let &Err(ref errors) = &key_result {
+                        error_vec.extend({
+                            let mut new_errors = vec![];
+                            for error in errors {
+                                new_errors.push(String::from(error.as_str()));
+                            }
+
+                            new_errors
+                        });
+                    }
+
+                    if let &Err(ref errors) = &signature_result {
+                        error_vec.extend({
+                            let mut new_errors = vec![];
+                            for error in errors {
+                                new_errors.push(String::from(error.as_str()));
+                            }
+
+                            new_errors
+                        });
+                    }
+
+                    if let (Ok(key), Ok(signature)) = (key_result, signature_result) {
+
+                        return Ok(Auth::Authority(Authority {
                             key,
                             signature,
                         }));
@@ -91,12 +139,28 @@ impl Auth {
                 }
             }
 
-            _ => {
-                eprintln!("'auth' key expects an string, or table with the key 'secret' or keys 'signature' and 'key'");
-            }
+            _ => {}
         }
 
-        None
+        error_vec.push(String::from("'auth' key expects an string, or table with the key 'secret' or keys 'signature' and 'key'"));
+
+        Err(error_vec)
+    }
+
+    pub fn is_authority(&self) -> bool {
+        if let &Auth::Authority(_) = self {
+            return true;
+        }
+
+        false
+    }
+
+    pub fn is_shared_secret(&self) -> bool {
+        if let &Auth::SharedSecret(_) = self {
+            return true;
+        }
+
+        false
     }
 }
 
@@ -106,32 +170,68 @@ pub struct Authority {
     pub signature: Bytes,
 }
 
-#[derive(Debug)]
+pub struct SharedSecret {
+    pub secret: Bytes,
+    pub signing_key: SigningKey,
+}
+
+impl Debug for SharedSecret {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "SharedSecret {{ secret: {:?} }}", self.secret)
+    }
+}
+
+impl SharedSecret {
+    pub fn new(secret: Bytes) -> SharedSecret {
+        SharedSecret {
+            signing_key: SigningKey::new(&digest::SHA512, &secret),
+            secret,
+        }
+    }
+}
+
 pub struct Identity {
     pub key: Bytes,
     pub name: Option<String>,
-    pub id: Uuid,
+    pub key_pair: Ed25519KeyPair,
+    pub public_key: Bytes,
+}
+
+impl Debug for Identity {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "Identity {{ public_key: {:?}, name: {:?} }}", self.public_key, self.name)
+    }
 }
 
 impl Identity {
-    pub fn from_value(value: &Value) -> Option<Identity> {
+    pub fn sign(&self, msg: &[u8]) -> Bytes {
+        return Bytes::from(self.key_pair.sign(msg).as_ref());
+    }
+
+    pub fn from_value(value: &Value) -> Result<Identity, Vec<String>> {
+        let mut error_vec = vec![];
+
         match value {
             &Value::Table(ref table) => {
                 let mut has_errors = false;
                 let mut key: Bytes = Bytes::new();
                 let mut name: Option<String> = None;
-                let mut id: Uuid = Uuid::new_v4();
 
                 if table.contains_key("key") {
                     let n = &table["key"];
 
-                    if let Some(b) = parse_file_or_value(n, "identity.key", true) {
-                        key = b;
-                    } else {
-                        has_errors = true;
+                    match parse_file_or_value(n, "identity.key", true) {
+                        Ok(key_b) => {
+                            key = key_b
+                        }
+
+                        Err(err) => {
+                            error_vec.extend(err);
+                            has_errors = true;
+                        }
                     }
                 } else {
-                    eprintln!("'identity' is missing value 'key'");
+                    error_vec.push(String::from("'identity' is missing value 'key'"));
                     has_errors = true;
                 }
 
@@ -141,49 +241,102 @@ impl Identity {
                     if let &Value::String(ref string) = n {
                         name = Some(string.clone());
                     } else {
-                        eprintln!("'identity.name' should be a string, ignoring value");
+                        error_vec.push(String::from("'identity.name' should be a string, ignoring value"));
                     }
-                }
-
-                if table.contains_key("id") {
-                    let n = &table["id"];
-
-                    if let &Value::String(ref string) = n {
-                        let mut uuid_str = string.clone();
-                        match Uuid::parse_str(&uuid_str) {
-                            Ok(uuid) => {
-                                id = uuid;
-                            }
-
-                            Err(err) => {
-                                eprintln!("'identity.id' failed parsing, invalid uuid");
-                                has_errors = true;
-                            }
-                        }
-                    } else {
-                        eprintln!("'identity.id' should be a string");
-                        has_errors = true;
-                    }
-                } else {
-                    eprintln!("'identity' is missing value 'id'");
-                    has_errors = true;
                 }
 
                 if !has_errors {
-                    return Some(Identity {
+                    let key_pair = Ed25519KeyPair::from_seed_unchecked(Input::from(&key.clone())).unwrap();
+                    return Ok(Identity {
                         name,
                         key,
-                        id
-                    })
+                        public_key: Bytes::from(key_pair.public_key_bytes()),
+                        key_pair,
+                    });
                 }
             }
 
             _ => {
-                eprintln!("'identity' key expects an table with keys 'key', 'name' and 'id'");
+                error_vec.push(String::from("'identity' key expects a table with at least the key 'key' and optionally 'name'"));
             }
         }
 
-        None
+        Err(error_vec)
+    }
+}
+
+pub struct Network {
+    pub id: [u8; 20],
+    pub code: Option<String>,
+}
+
+impl Network {
+    pub fn from_value(value: &Value) -> Result<Network, Vec<String>> {
+        let mut error_vec = vec![];
+
+        match value {
+            &Value::Table(ref table) => {
+                if table.contains_key("id") {
+                    if let &Value::String(ref id_str) = &table["id"] {
+                        let id_str = id_str.as_str();
+
+                        if id_str.len() == 40 && id_str.chars().all(|char| char.is_ascii_hexdigit()) {
+                            let mut network_id: [u8; 20] = [0; 20];
+
+                            for i in 0..20 {
+                                let offset = i * 2;
+                                network_id[i] = u8::from_str_radix(&id_str[offset..offset + 2], 16).unwrap();
+                            }
+
+                            return Ok(Network {
+                                id: network_id,
+                                code: None,
+                            });
+                        }
+                    }
+
+                    error_vec.push(String::from("'network.id' key needs to be a 40 letter long hexadecimal string"));
+                    return Err(error_vec);
+                }
+
+                if table.contains_key("code") {
+                    if let &Value::String(ref code_str) = &table["code"] {
+                        let digestion = digest::digest(&digest::SHA1, &code_str.clone().into_bytes());
+                        let mut network_id: [u8; 20] = [0; 20];
+                        network_id.copy_from_slice(&digestion.as_ref()[..20]);
+
+                        return Ok(Network {
+                            id: network_id,
+                            code: Some(code_str.clone()),
+                        });
+                    }
+
+                    error_vec.push(String::from("'network.code' key needs to be a string"));
+                    return Err(error_vec);
+                }
+            }
+
+            _ => {
+                error_vec.push(String::from("'network' key expects a table with the key 'code' or 'id'"));
+            }
+        }
+
+        Err(error_vec)
+    }
+}
+
+impl Debug for Network {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let id = &self.id[..];
+        let mut hex_string = String::with_capacity(40);
+        let hex = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"];
+
+        for byte in id {
+            hex_string.push_str(hex[((byte >> 4) & 15 as u8) as usize]);
+            hex_string.push_str(hex[(byte & 15) as usize]);
+        }
+
+        write!(f, "Network {{ id: {}, code: {:?} }}", hex_string, self.code)
     }
 }
 
@@ -191,50 +344,81 @@ impl Identity {
 pub struct Config {
     pub identity: Identity,
     pub auth: Auth,
+    pub network: Network,
 }
 
 impl Config {
-    pub fn from_value(value: &Value) -> Option<Config> {
+    pub fn from_value(value: &Value) -> Result<Config, Vec<String>> {
+        let mut error_vec = vec![];
+
         match value {
             &Value::Table(ref table) => {
                 let mut auth: Option<Auth> = None;
                 let mut identity: Option<Identity> = None;
+                let mut network: Option<Network> = None;
                 let mut has_errors: bool = false;
                 if table.contains_key("auth") {
-                    if let Some(auth_res) = Auth::from_value(&table["auth"]) {
-                        auth = Some(auth_res);
-                    } else {
-                        has_errors = true;
+                    match Auth::from_value(&table["auth"]) {
+                        Ok(auth_) => {
+                            auth = Some(auth_);
+                        }
+
+                        Err(err) => {
+                            error_vec.extend(err);
+                            has_errors = true;
+                        }
                     }
                 } else {
                     has_errors = true;
-                    eprintln!("Config is missing 'auth' key");
+                    error_vec.push(String::from("Config is missing 'auth' key"));
                 }
 
                 if table.contains_key("identity") {
-                    if let Some(ident_res) = Identity::from_value(&table["identity"]) {
-                        identity = Some(ident_res);
-                    } else {
-                        has_errors = true;
+                    match Identity::from_value(&table["identity"]) {
+                        Ok(ident) => {
+                            identity = Some(ident);
+                        }
+
+                        Err(err) => {
+                            error_vec.extend(err);
+                            has_errors = true;
+                        }
                     }
                 } else {
                     has_errors = true;
-                    eprintln!("Config is missing 'identity' key");
+                    error_vec.push(String::from("Config is missing 'identity' key"));
                 }
 
-                if ! has_errors {
-                    return Some(Config {
+                if table.contains_key("network") {
+                    match Network::from_value(&table["network"]) {
+                        Ok(net) => {
+                            network = Some(net);
+                        }
+
+                        Err(err) => {
+                            error_vec.extend(err);
+                            has_errors = true;
+                        }
+                    }
+                } else {
+                    has_errors = true;
+                    error_vec.push(String::from("Config is missing 'network' key"));
+                }
+
+                if !has_errors {
+                    return Ok(Config {
                         auth: auth.unwrap(),
-                        identity: identity.unwrap()
+                        identity: identity.unwrap(),
+                        network: network.unwrap(),
                     });
                 }
             }
 
             _ => {
-                eprintln!("Config must be a table.")
+                error_vec.push(String::from("Config must be a table."));
             }
         }
 
-        None
+        Err(error_vec)
     }
 }
