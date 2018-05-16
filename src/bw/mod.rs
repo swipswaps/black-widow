@@ -20,6 +20,21 @@ pub mod macros {
             }
         };
     }
+
+    macro_rules! debug_println {
+        () => {
+            #[cfg(debug_assertions)]
+            println!();
+        };
+        ($fmt:expr) => {
+            #[cfg(debug_assertions)]
+            println!($fmt);
+        };
+        ($fmt:expr, $($arg:tt)*) => {
+            #[cfg(debug_assertions)]
+            println!($fmt, $($arg)*);
+        };
+    }
 }
 
 pub mod node;
@@ -34,7 +49,7 @@ pub mod prelude {
     pub use super::protocol::{Message, EncryptedMessage, PacketType, Packet};
     pub use super::server::{ServerEvent, Server, ConnectionState, ConnectionInfo, MutexConnectionInfo};
     pub use super::config::*;
-    pub use super::packet;
+    pub use super::packet::*;
     #[macro_use]
     pub use super::macros;
 }

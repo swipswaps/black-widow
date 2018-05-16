@@ -5,6 +5,7 @@ use std::u64;
 use std::sync::{Mutex, MutexGuard, Arc};
 use std::time::Instant;
 use std::collections::HashMap;
+use std::collections::hash_map::Values;
 
 use tokio::prelude::*;
 use futures::stream::{Stream, SplitStream, SplitSink};
@@ -133,35 +134,60 @@ impl ConnectionCollection {
         }
     }
 
-    pub fn add(&mut self, info: ConnectionInfo) {
+    pub fn add(&mut self, info: ConnectionInfo) -> MutexConnectionInfo {
         let addr = info.addr.clone();
-        let key =
+        let key = info.public_key.clone();
 
-        let index = self.map.insert(self.pointer++, info);
+        let index = self.pointer;
+        let mutex = MutexConnectionInfo::wrap(info);
+        self.pointer += 1;
+        let new_mutex = mutex.clone();
 
-        if let Some(old_index) = self.by_addr.remove(&info.addr) {
+        self.map.insert(index, mutex);
+
+        if let Some(old_index) = self.by_addr.remove(&addr) {
             self.remove_connection_by_pointer(old_index);
         }
 
-        if let Some(key) = info.public_key.clone() {
+        self.by_addr.insert(addr, index);
+
+        if let Some(key) = key {
             if let Some(old_index) = self.by_public.remove(&key.to_vec()) {
                 self.remove_connection_by_pointer(old_index);
             }
 
-            self.by_public.insert();
+            self.by_public.insert(key.to_vec(), index);
         }
+
+        new_mutex
     }
 
     pub fn get_by_addr(&mut self, addr: SocketAddr) -> Option<MutexConnectionInfo> {
-        if let Some(item) = self.by_addr.get(&addr) {
-            self.get_by_pointer(item.clone())
+        let res = {
+            if let Some(x) = self.by_addr.get(&addr) {
+                Some(x.clone())
+            } else {
+                None
+            }
+        };
+
+        if let Some(item) = res {
+            self.get_by_pointer(item)
         } else {
             None
         }
     }
 
     pub fn get_by_public_key(&mut self, public: Bytes) -> Option<MutexConnectionInfo> {
-        if let Some(item) = self.by_public.get(&public.to_vec()) {
+        let res = {
+            if let Some(x) = self.by_public.get(&public.to_vec()) {
+                Some(x.clone())
+            } else {
+                None
+            }
+        };
+
+        if let Some(item) = res {
             self.get_by_pointer(item.clone())
         } else {
             None
@@ -209,6 +235,16 @@ impl ConnectionCollection {
             }
         });
     }
+
+    fn link(&mut self, addr: SocketAddr, public: Bytes) {
+        if let Some(index) = self.by_addr.get(&addr) {
+            self.by_public.insert(public.to_vec(), index.clone());
+        }
+    }
+
+    pub fn iter(&self) -> Values<usize, MutexConnectionInfo> {
+        self.map.values()
+    }
 }
 
 pub struct Server<R>
@@ -233,7 +269,7 @@ impl<R> Server<R>
         Server {
             queue: vec![],
             closed: false,
-            connections: Arc::new(Mutex::new(HashMap::new())),
+            connections: ConnectionCollection::new(),
             config,
             router: Arc::new(Mutex::new(router)),
         }
@@ -256,7 +292,7 @@ impl<R> Server<R>
     fn handle_message(&mut self, message: Message, connection_info: MutexConnectionInfo) {
         {
             let info = connection_info.get_mutex();
-            println!("Message received: {:?} from {:?}", message, info.addr);
+            debug_println!("Message received: {:?} from {:?}", message, info.addr);
         }
 
         if message.message_type == 1 {
@@ -305,6 +341,10 @@ impl<R> Server<R>
 
         let state = mem::replace(&mut info.connection_state, ConnectionState::Null);
 
+        info.public_key = Some(key_exchange.public_key.clone());
+
+        self.connections.link(info.addr.clone(), key_exchange.public_key.clone());
+
         match state {
             ConnectionState::KeyExchange(key) => {
                 match key_exchange.derive_encryption_parameters(key, &self.config) {
@@ -337,21 +377,12 @@ impl<R> Server<R>
         }
     }
 
-    fn get_connection_info(&self, addr: SocketAddr) -> Option<MutexConnectionInfo> {
-        let mut connection_map = self.connections.lock().unwrap();
-
-        if !connection_map.contains_key(&addr) {
-            let new_info = MutexConnectionInfo::new(addr);
-            connection_map.insert(addr, new_info);
+    fn get_connection_info(&mut self, addr: SocketAddr) -> MutexConnectionInfo {
+        if let Some(connection_info) = self.connections.get_by_addr(addr.clone()) {
+            return connection_info.clone();
         }
 
-        let val = connection_map.get(&addr);
-
-        if let Some(x) = val {
-            return Some(x.clone());
-        }
-
-        None
+        self.connections.add(ConnectionInfo::new(addr))
     }
 
     fn on_packet(&mut self, data: Bytes, addr: SocketAddr) {
@@ -361,15 +392,13 @@ impl<R> Server<R>
             }
 
             Some(Packet::KeyExchange(key_exchange)) => {
-                if let Some(connection_info) = self.get_connection_info(addr) {
-                    self.handle_key_exchange(key_exchange, connection_info);
-                }
+                let info = self.get_connection_info(addr);
+                self.handle_key_exchange(key_exchange, info );
             }
 
             Some(Packet::EncryptedMessage(encrypted_message)) => {
-                if let Some(connection_info) = self.get_connection_info(addr) {
-                    self.on_message(encrypted_message, connection_info);
-                }
+                let info = self.get_connection_info(addr);
+                self.on_message(encrypted_message, info);
             }
 
             _ => {}
@@ -377,7 +406,7 @@ impl<R> Server<R>
     }
 
     fn on_event(&mut self, event: ServerEvent) {
-        println!("Got event: {:?}", event);
+        debug_println!("Got event: {:?}", event);
 
         match event {
             ServerEvent::Tunnel(data) => self.on_tunnel(data),
@@ -401,9 +430,10 @@ impl<R> Server<R>
 
     pub fn connect(&mut self, addr: SocketAddr) {
         {
-            let connections = self.connections.lock().unwrap();
-            if connections.contains_key(&addr) && connections[&addr].get_mutex().connection_state.is_null() {
-                return;
+            if let Some(connection) = self.connections.get_by_addr(addr.clone()) {
+                if connection.get_mutex().connection_state.is_null() {
+                    return;
+                }
             }
         }
 
@@ -418,8 +448,7 @@ impl<R> Server<R>
                 return;
             }
 
-            let mut conns = self.connections.lock().unwrap();
-            conns.insert(addr, MutexConnectionInfo::wrap(info));
+            self.connections.add(info);
         }
     }
 }

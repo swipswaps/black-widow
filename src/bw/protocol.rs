@@ -75,7 +75,6 @@ impl Packet {
             }
 
             Some(PacketType::KeyExchange) => {
-                println!("Trying to create key exchange from: {:?}", payload);
                 if let Some(key_exchange) = KeyExchange::from_bytes(payload) {
                     Some(Packet::KeyExchange(key_exchange))
                 } else {
@@ -236,15 +235,29 @@ impl EncryptedMessage {
 }
 
 #[derive(Clone, Debug)]
+enum MessageType {
+    Ethernet = 0,
+
+}
+
+impl From<u8> for MessageType {
+    fn from(n: u8) -> Self {
+        match n {
+            n if n == MessageType::Ethernet as u8 => MessageType::Ethernet,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Message {
     pub compressed: bool,
-    pub message_type: u8,
+    pub message_type: MessageType,
     pub payload: Bytes,
     pub hmac: Bytes,
 }
 
 impl Message {
-    pub fn new(message_type: u8, payload: Bytes) -> Message {
+    pub fn new(message_type: MessageType, payload: Bytes) -> Message {
         Message {
             compressed: false,
             message_type,
@@ -260,7 +273,7 @@ impl Message {
 
         Some(Message {
             compressed: (data[0] & 128) == 128,
-            message_type: (data[0] & 127),
+            message_type: MessageType::from(data[0] & 127),
             payload,
             hmac,
         })
