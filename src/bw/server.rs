@@ -19,6 +19,9 @@ use untrusted;
 use super::packet::EthernetPacket;
 use super::protocol::*;
 use super::config::Config;
+use super::router::{Router, DumbRouter};
+
+#[macro_use] use super::macros;
 
 #[derive(Debug)]
 pub enum ServerEvent {
@@ -48,10 +51,10 @@ impl ConnectionState {
 }
 
 pub struct ConnectionInfo {
-    addr: SocketAddr,
-    last_update: Instant,
-    connection_state: ConnectionState,
-    public_key: Option<Bytes>,
+    pub addr: SocketAddr,
+    pub last_update: Instant,
+    pub connection_state: ConnectionState,
+    pub public_key: Option<Bytes>,
     packet_id: u64,
 }
 
@@ -94,7 +97,7 @@ impl ConnectionInfo {
 }
 
 #[derive(Clone)]
-struct MutexConnectionInfo(Arc<Mutex<ConnectionInfo>>);
+pub struct MutexConnectionInfo(Arc<Mutex<ConnectionInfo>>);
 
 impl MutexConnectionInfo {
     pub fn new(addr: SocketAddr) -> MutexConnectionInfo {
@@ -106,27 +109,133 @@ impl MutexConnectionInfo {
         return MutexConnectionInfo(Arc::new(Mutex::new(info)));
     }
 
-    fn get_mutex(&self) -> MutexGuard<ConnectionInfo> { self.0.lock().unwrap() }
+    pub fn get_mutex(&self) -> MutexGuard<ConnectionInfo> { self.0.lock().unwrap() }
 
     pub fn bump(&self) {
         self.get_mutex().bump();
     }
 }
 
-pub struct Server {
-    queue: Vec<ServerEvent>,
-    closed: bool,
-    connections: Arc<Mutex<HashMap<SocketAddr, MutexConnectionInfo>>>,
-    config: Config,
+pub struct ConnectionCollection {
+    pointer: usize,
+    by_public: HashMap<Vec<u8>, usize>,
+    by_addr: HashMap<SocketAddr, usize>,
+    map: HashMap<usize, MutexConnectionInfo>,
 }
 
-impl Server {
-    pub fn new(config: Config) -> Server {
+impl ConnectionCollection {
+    pub fn new() -> ConnectionCollection {
+        ConnectionCollection {
+            pointer: 0,
+            by_addr: HashMap::new(),
+            by_public: HashMap::new(),
+            map: HashMap::new(),
+        }
+    }
+
+    pub fn add(&mut self, info: ConnectionInfo) {
+        let addr = info.addr.clone();
+        let key =
+
+        let index = self.map.insert(self.pointer++, info);
+
+        if let Some(old_index) = self.by_addr.remove(&info.addr) {
+            self.remove_connection_by_pointer(old_index);
+        }
+
+        if let Some(key) = info.public_key.clone() {
+            if let Some(old_index) = self.by_public.remove(&key.to_vec()) {
+                self.remove_connection_by_pointer(old_index);
+            }
+
+            self.by_public.insert();
+        }
+    }
+
+    pub fn get_by_addr(&mut self, addr: SocketAddr) -> Option<MutexConnectionInfo> {
+        if let Some(item) = self.by_addr.get(&addr) {
+            self.get_by_pointer(item.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn get_by_public_key(&mut self, public: Bytes) -> Option<MutexConnectionInfo> {
+        if let Some(item) = self.by_public.get(&public.to_vec()) {
+            self.get_by_pointer(item.clone())
+        } else {
+            None
+        }
+    }
+
+    fn get_by_pointer_unchecked(&mut self, pointer: usize) -> Option<MutexConnectionInfo> {
+        if let Some(info) = self.map.get(&pointer) {
+            Some(info.clone())
+        } else {
+            None
+        }
+    }
+
+    fn get_by_pointer(&mut self, pointer: usize) -> Option<MutexConnectionInfo> {
+        let info = self.get_by_pointer_unchecked(pointer);
+
+        if let Some(info) = info {
+            use_item!(info.0, connection => {
+                if connection.is_expired() {
+                    self.remove_connection_by_pointer(pointer);
+
+                    None
+                } else {
+                    Some(info)
+                }
+            })
+        } else {
+            None
+        }
+    }
+
+    fn remove_connection_by_pointer(&mut self, pointer: usize) {
+        if let Some(info) = self.map.remove(&pointer) {
+            self.remove_connection(info);
+        }
+    }
+
+    fn remove_connection(&mut self, connection: MutexConnectionInfo) {
+        use_item!(connection.0, connection => {
+            self.by_addr.remove(&connection.addr);
+
+            if let &Some(ref key) = &connection.public_key {
+                self.by_public.remove(&key.to_vec());
+            }
+        });
+    }
+}
+
+pub struct Server<R>
+    where R: Router<R> {
+    queue: Vec<ServerEvent>,
+    closed: bool,
+    pub connections: ConnectionCollection,
+    pub config: Config,
+    router: Arc<Mutex<R>>,
+}
+
+impl Server<DumbRouter> {
+    pub fn new(config: Config) -> Server<DumbRouter> {
+        Server::new_with_router(config, DumbRouter::new())
+    }
+}
+
+impl<R> Server<R>
+    where R: Router<R> {
+
+    fn new_with_router(config: Config, router: R) -> Server<R> {
         Server {
             queue: vec![],
             closed: false,
             connections: Arc::new(Mutex::new(HashMap::new())),
             config,
+            router: Arc::new(Mutex::new(router)),
         }
     }
 
@@ -135,30 +244,7 @@ impl Server {
     }
 
     fn on_tunnel(&mut self, data: Bytes) {
-        let mut events = vec![];
-        {
-            let x = self.connections.lock().unwrap();
-            let message = Message::new(1, data.clone());
-
-            for (addr, state) in x.iter() {
-                let mut mutex = state.get_mutex();
-                if !mutex.is_expired() {
-                    let next_id = mutex.next_packet_id();
-
-                    if let ConnectionState::Stream(ref paramaters) = mutex.connection_state {
-                        let encrypted_message = EncryptedMessage::new_from_message(next_id, &message, paramaters);
-
-                        if let Some(bytes) = Packet::EncryptedMessage(encrypted_message).get_bytes() {
-                            events.push(ServerEvent::Packet(bytes, addr.clone()));
-                        }
-                    } else {
-                        continue;
-                    }
-                }
-            }
-        }
-
-        for event in events {
+        for event in use_item!(self.router, router => router.publish(self, Message::new(1, data.clone()))) {
             self.queue_event(event);
         }
     }
@@ -168,6 +254,11 @@ impl Server {
     }
 
     fn handle_message(&mut self, message: Message, connection_info: MutexConnectionInfo) {
+        {
+            let info = connection_info.get_mutex();
+            println!("Message received: {:?} from {:?}", message, info.addr);
+        }
+
         if message.message_type == 1 {
             self.queue_event(ServerEvent::Tunnel(message.payload));
         }
@@ -198,7 +289,6 @@ impl Server {
                 let mut info = connection_info.get_mutex();
                 info.bump();
             }
-
 
             self.handle_message(message, connection_info);
         }
@@ -271,7 +361,6 @@ impl Server {
             }
 
             Some(Packet::KeyExchange(key_exchange)) => {
-
                 if let Some(connection_info) = self.get_connection_info(addr) {
                     self.handle_key_exchange(key_exchange, connection_info);
                 }
@@ -335,7 +424,8 @@ impl Server {
     }
 }
 
-impl Stream for Server {
+impl<R> Stream for Server<R>
+    where R: Router<R> {
     type Item = ServerEvent;
     type Error = Error;
 
@@ -348,7 +438,8 @@ impl Stream for Server {
     }
 }
 
-impl Sink for Server {
+impl<R> Sink for Server<R>
+    where R: Router<R> {
     type SinkItem = ServerEvent;
     type SinkError = Error;
 

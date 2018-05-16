@@ -111,7 +111,7 @@ fn main() {
     let core = Core::new().unwrap();
     let iface = Iface::new("bw%d", Mode::Tap).unwrap();
     let tunnel = IfaceAsync::new(iface, &core.handle()).unwrap();
-    let socket = UdpSocket::bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 55555)).unwrap();
+    let socket = UdpSocket::bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0)).unwrap();
     println!("Listening on {:?}", socket.local_addr().unwrap());
     let socket_stream = UdpFramed::new(socket, BytesCodec::new());
 
@@ -159,9 +159,15 @@ fn main() {
         ServerEvent::Tunnel(Bytes::from(&data[4..]))
     });
 
-    let joined_server_sink = control_pipe_in.select(socket_pipe_in).select(tunnel_pipe_in).forward(server_in);
+    let joined_server_sink = control_pipe_in
+        .select(socket_pipe_in)
+        .select(tunnel_pipe_in)
+        .forward(server_in);
 
     tokio::run({
-        joined_server_sink.join(server_out).map(|_| ()).map_err(|_| ())
+        joined_server_sink
+            .join(server_out)
+            .map(|_| ())
+            .map_err(|_| ())
     })
 }
