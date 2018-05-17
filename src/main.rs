@@ -1,3 +1,5 @@
+#![feature(proc_macro, specialization, proc_macro_path_invoc, extern_prelude)]
+
 extern crate futures;
 extern crate tokio;
 extern crate tokio_core;
@@ -16,10 +18,12 @@ extern crate serde_derive;
 #[macro_use]
 extern crate toml;
 
+#[cfg(feature = "python-router")]
+extern crate pyo3;
+
 pub mod bw;
 
-use bw::server::{Server, ServerEvent};
-use bw::config::Config;
+use bw::prelude::*;
 
 use tokio_core::reactor::Core;
 
@@ -117,7 +121,8 @@ fn main() {
 
     let runtime = core.remote();
 
-    let mut server = Server::new(config);
+    // let mut server = Server::new(config);
+    let mut server = Server::new_with_router(config, PythonRouter::new());
 
     let mut stdio_thing = Stdio::new();
 

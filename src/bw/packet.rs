@@ -16,7 +16,7 @@ macro_rules! u16 {
 }
 
 
-#[derive(Debug)]
+#[derive(Debug, Hash, Eq, PartialOrd, PartialEq)]
 pub struct MacAddress(u8, u8, u8, u8, u8, u8);
 
 impl MacAddress {

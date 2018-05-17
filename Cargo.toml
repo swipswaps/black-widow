@@ -20,7 +20,11 @@ tokio-udp = "0.1.0"
 toml = "0.4.6"
 tun-tap = "0.1.1"
 untrusted = "0.5.1"
+pyo3 = { version = "*", optional = true, features = ["python3"] }
 
 [dependencies.uuid]
 features = ["v4"]
 version = "0.6.2"
+
+[features]
+python-router = ["pyo3"]

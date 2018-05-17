@@ -17,10 +17,7 @@ use ring;
 use untrusted;
 
 
-use super::packet::EthernetPacket;
-use super::protocol::*;
-use super::config::Config;
-use super::router::{Router, DumbRouter};
+use super::prelude::*;
 
 #[macro_use] use super::macros;
 
@@ -265,7 +262,7 @@ impl Server<DumbRouter> {
 impl<R> Server<R>
     where R: Router<R> {
 
-    fn new_with_router(config: Config, router: R) -> Server<R> {
+    pub fn new_with_router(config: Config, router: R) -> Server<R> {
         Server {
             queue: vec![],
             closed: false,
@@ -280,9 +277,7 @@ impl<R> Server<R>
     }
 
     fn on_tunnel(&mut self, data: Bytes) {
-        for event in use_item!(self.router, router => router.publish(self, Message::new(1, data.clone()))) {
-            self.queue_event(event);
-        }
+        use_item!(self.router, mut router => router.handle_packet(data));
     }
 
     fn on_dht_krpc(&self, data: Bytes, addr: SocketAddr) {
@@ -295,7 +290,7 @@ impl<R> Server<R>
             debug_println!("Message received: {:?} from {:?}", message, info.addr);
         }
 
-        if message.message_type == 1 {
+        if message.message_type == MessageType::Ethernet {
             self.queue_event(ServerEvent::Tunnel(message.payload));
         }
     }

@@ -234,16 +234,17 @@ impl EncryptedMessage {
     }
 }
 
-#[derive(Clone, Debug)]
-enum MessageType {
+#[derive(Clone, Copy, Debug, PartialOrd, PartialEq)]
+pub enum MessageType {
     Ethernet = 0,
-
+    Unknown = 255,
 }
 
 impl From<u8> for MessageType {
     fn from(n: u8) -> Self {
         match n {
             n if n == MessageType::Ethernet as u8 => MessageType::Ethernet,
+            _ => MessageType::Unknown,
         }
     }
 }
@@ -301,7 +302,7 @@ impl Message {
         }
 
         let mut cursor = Cursor::new(out);
-        cursor.write_u8({ if self.compressed { 128 } else { 0 } } + (self.message_type & 127));
+        cursor.write_u8({ if self.compressed { 128 } else { 0 } } + (self.message_type as u8 & 127));
         cursor.write(&self.payload);
         cursor.write(&self.hmac);
 

@@ -5,16 +5,34 @@ pub mod macros {
         ($which:expr, $name:tt => $with:expr) => {
             {
                 let __arc = $which.clone();
+                let $name = __arc.lock().unwrap();
+
+                $with
+            }
+        };
+
+        ($which:expr, mut $name:tt => $with:expr) => {
+            {
+                let __arc = $which.clone();
                 let mut $name = __arc.lock().unwrap();
 
                 $with
             }
         };
 
-        ($which:expr, $with:expr) => {
+        (mut $which:ident, $with:expr) => {
             {
                 let __arc = $which.clone();
                 let mut $which = __arc.lock().unwrap();
+
+                $with
+            }
+        };
+
+        ($which:ident, $with:expr) => {
+            {
+                let __arc = $which.clone();
+                let $which = __arc.lock().unwrap();
 
                 $with
             }
@@ -46,10 +64,11 @@ pub mod config;
 pub mod router;
 
 pub mod prelude {
-    pub use super::protocol::{Message, EncryptedMessage, PacketType, Packet};
+    pub use super::protocol::*;
     pub use super::server::{ServerEvent, Server, ConnectionState, ConnectionInfo, MutexConnectionInfo};
     pub use super::config::*;
     pub use super::packet::*;
+    pub use super::router::*;
     #[macro_use]
     pub use super::macros;
 }
