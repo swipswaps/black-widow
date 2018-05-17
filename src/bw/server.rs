@@ -260,9 +260,11 @@ impl Server<DumbRouter> {
 }
 
 impl<R> Server<R>
-    where R: Router<R> {
+    where R: Router<R> + 'static {
 
-    pub fn new_with_router(config: Config, router: R) -> Server<R> {
+    pub fn new_with_router(config: Config, mut router: R) -> Server<R> {
+        router.start();
+
         Server {
             queue: vec![],
             closed: false,
@@ -449,7 +451,7 @@ impl<R> Server<R>
 }
 
 impl<R> Stream for Server<R>
-    where R: Router<R> {
+    where R: Router<R>  + 'static {
     type Item = ServerEvent;
     type Error = Error;
 
@@ -463,7 +465,7 @@ impl<R> Stream for Server<R>
 }
 
 impl<R> Sink for Server<R>
-    where R: Router<R> {
+    where R: Router<R>  + 'static {
     type SinkItem = ServerEvent;
     type SinkError = Error;
 

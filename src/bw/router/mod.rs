@@ -9,7 +9,7 @@ mod python_router;
 
 pub trait Router<T>
     where T: Router<T> {
-    fn start(&mut self, cb: fn(ServerEvent) -> ());
+    fn start(&mut self);
     fn handle_message(&mut self, message: Message);
     fn handle_packet(&mut self, packet: Bytes);
 }

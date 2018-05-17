@@ -20,7 +20,7 @@ impl DumbRouter {
 }
 
 impl Router<DumbRouter> for DumbRouter {
-    fn start(&mut self, cb: fn(ServerEvent)) {
+    fn start(&mut self) {
         unimplemented!()
     }
 
