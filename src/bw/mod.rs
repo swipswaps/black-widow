@@ -65,7 +65,7 @@ pub mod router;
 
 pub mod prelude {
     pub use super::protocol::*;
-    pub use super::server::{ServerEvent, Server, ConnectionState, ConnectionInfo, MutexConnectionInfo};
+    pub use super::server::*;
     pub use super::config::*;
     pub use super::packet::*;
     pub use super::router::*;

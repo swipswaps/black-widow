@@ -1,5 +1,5 @@
-#![feature(proc_macro, specialization, proc_macro_path_invoc, extern_prelude)]
-
+#![feature(proc_macro, specialization, proc_macro_path_invoc, extern_prelude, try_from)]
+#![allow(warnings)]
 extern crate futures;
 extern crate tokio;
 extern crate tokio_core;
@@ -110,7 +110,7 @@ impl Sink for Stdio {
 fn main() {
     let config = get_config().unwrap();
 
-    println!("Working with config: {:?}", config);
+    println!("Working with config: {:#?}", config);
 
     let core = Core::new().unwrap();
     let iface = Iface::new("bw%d", Mode::Tap).unwrap();
@@ -122,7 +122,7 @@ fn main() {
     let runtime = core.remote();
 
     // let mut server = Server::new(config);
-    let mut server = Server::new_with_router(config, PythonRouter::new());
+    let mut server = RouterUnawareServer::new(config);
 
     let mut stdio_thing = Stdio::new();
 

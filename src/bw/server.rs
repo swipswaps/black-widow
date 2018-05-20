@@ -19,9 +19,10 @@ use untrusted;
 
 use super::prelude::*;
 
-#[macro_use] use super::macros;
+#[macro_use]
+use super::macros;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ServerEvent {
     Tunnel(Bytes),
     Packet(Bytes, SocketAddr),
@@ -44,6 +45,14 @@ impl ConnectionState {
             _ => {
                 false
             }
+        }
+    }
+
+    pub fn get_parameters(&self) -> Option<EncryptionParameters> {
+        if let &ConnectionState::Stream(ref params) = self {
+            Some(params.clone())
+        } else {
+            None
         }
     }
 }
@@ -95,22 +104,35 @@ impl ConnectionInfo {
 }
 
 #[derive(Clone)]
-pub struct MutexConnectionInfo(Arc<Mutex<ConnectionInfo>>);
+pub struct MutexConnectionInfo(Arc<Mutex<ConnectionInfo>>, SocketAddr);
 
 impl MutexConnectionInfo {
     pub fn new(addr: SocketAddr) -> MutexConnectionInfo {
         let info = ConnectionInfo::new(addr);
-        return MutexConnectionInfo::wrap(info);
+
+        MutexConnectionInfo::wrap(info)
     }
 
     pub fn wrap(info: ConnectionInfo) -> MutexConnectionInfo {
-        return MutexConnectionInfo(Arc::new(Mutex::new(info)));
+        let addr = info.addr.clone();
+
+        MutexConnectionInfo(Arc::new(Mutex::new(info)), addr)
     }
 
-    pub fn get_mutex(&self) -> MutexGuard<ConnectionInfo> { self.0.lock().unwrap() }
+    pub fn use_info<T, F: FnOnce(&mut ConnectionInfo) -> T>(&self, cb: F) -> T {
+        println!("ConnectionInfo({:?}): Open", self.1);
+        let res = use_item!(self.0, mut conn => cb(&mut conn));
+        println!("ConnectionInfo({:?}): Close", self.1);
+
+        res
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.1.clone()
+    }
 
     pub fn bump(&self) {
-        self.get_mutex().bump();
+        self.use_info(|info| info.bump());
     }
 }
 
@@ -201,19 +223,18 @@ impl ConnectionCollection {
 
     fn get_by_pointer(&mut self, pointer: usize) -> Option<MutexConnectionInfo> {
         let info = self.get_by_pointer_unchecked(pointer);
+        let mut should_remove = false;
 
         if let Some(info) = info {
-            use_item!(info.0, connection => {
-                if connection.is_expired() {
-                    self.remove_connection_by_pointer(pointer);
+            if info.use_info(|connection| connection.is_expired()) {
+                self.remove_connection_by_pointer(pointer);
 
-                    None
-                } else {
-                    Some(info)
-                }
-            })
+                None
+            } else {
+                Some(info)
+            }
         } else {
-            None
+            return None;
         }
     }
 
@@ -224,7 +245,7 @@ impl ConnectionCollection {
     }
 
     fn remove_connection(&mut self, connection: MutexConnectionInfo) {
-        use_item!(connection.0, connection => {
+        connection.use_info(|connection| {
             self.by_addr.remove(&connection.addr);
 
             if let &Some(ref key) = &connection.public_key {
@@ -242,6 +263,93 @@ impl ConnectionCollection {
     pub fn iter(&self) -> Values<usize, MutexConnectionInfo> {
         self.map.values()
     }
+
+    pub fn get_valid(&mut self) -> Vec<MutexConnectionInfo> {
+        let (expired, valid) = self.map.values().cloned().partition(|x| x.use_info(|x| x.is_expired()));
+
+        for expire in expired {
+            self.remove_connection(expire);
+        }
+
+        return valid;
+    }
+}
+
+pub enum RouterUnawareServer {
+    #[cfg(feature = "python-router")]
+    PythonRouter(Server<PythonRouter>),
+    DumbRouter(Server<DumbRouter>),
+}
+
+macro_rules! router_unaware_action {
+    ($on:ident, $name:tt => $action:expr) => {
+        match $on {
+            RouterUnawareServer::PythonRouter($name) => {
+                $action
+            },
+
+            #[cfg(feature = "python-router")]
+            RouterUnawareServer::DumbRouter($name) => {
+                $action
+            },
+        }
+    };
+}
+
+impl RouterUnawareServer {
+    pub fn new(config: Config) -> RouterUnawareServer {
+        let router = config.router.name.clone();
+
+        match router {
+            ChosenRouter::Dumb => {
+                RouterUnawareServer::DumbRouter(Server::new(config))
+            }
+
+            #[cfg(feature = "python-router")]
+            ChosenRouter::Python => {
+                let script = config.router.python.clone().unwrap().script.clone();
+
+                RouterUnawareServer::PythonRouter(Server::new_with_router(
+                    config,
+                    PythonRouter::new(script),
+                ))
+            }
+        }
+    }
+}
+
+impl ServerLike for RouterUnawareServer {
+    fn connect(&mut self, addr: SocketAddr) {
+        router_unaware_action!(self, router => {
+            router.connect(addr);
+        })
+    }
+}
+
+impl Stream for RouterUnawareServer {
+    type Item = ServerEvent;
+    type Error = Error;
+
+    fn poll(&mut self) -> Result<Async<Option<<Self as Stream>::Item>>, <Self as Stream>::Error> {
+        router_unaware_action!(self, router => router.poll())
+    }
+}
+
+impl Sink for RouterUnawareServer {
+    type SinkItem = ServerEvent;
+    type SinkError = Error;
+
+    fn start_send(&mut self, item: <Self as Sink>::SinkItem) -> Result<AsyncSink<<Self as Sink>::SinkItem>, <Self as Sink>::SinkError> {
+        router_unaware_action!(self, router => router.start_send(item))
+    }
+
+    fn poll_complete(&mut self) -> Result<Async<()>, <Self as Sink>::SinkError> {
+        router_unaware_action!(self, router => router.poll_complete())
+    }
+
+    fn close(&mut self) -> Result<Async<()>, <Self as Sink>::SinkError> {
+        router_unaware_action!(self, router => router.close())
+    }
 }
 
 pub struct Server<R>
@@ -253,6 +361,10 @@ pub struct Server<R>
     router: Arc<Mutex<R>>,
 }
 
+pub trait ServerLike {
+    fn connect(&mut self, addr: SocketAddr);
+}
+
 impl Server<DumbRouter> {
     pub fn new(config: Config) -> Server<DumbRouter> {
         Server::new_with_router(config, DumbRouter::new())
@@ -261,7 +373,6 @@ impl Server<DumbRouter> {
 
 impl<R> Server<R>
     where R: Router<R> + 'static {
-
     pub fn new_with_router(config: Config, mut router: R) -> Server<R> {
         router.start();
 
@@ -278,6 +389,86 @@ impl<R> Server<R>
         self.queue.push(event)
     }
 
+    fn check_queue(&mut self) -> bool {
+        let router_events = use_item!(self.router, mut r => {
+            if r.has_queue() {
+                r.flush_queue()
+            } else {
+                vec![]
+            }
+        });
+
+        if router_events.len() > 0 {
+            self.queue_router_events(router_events);
+        }
+
+        self.queue.len() > 0
+    }
+
+    fn queue_router_events(&mut self, events: Vec<RouterEvent>) {
+        let mut server_events = vec![];
+
+        for event in events {
+            match event {
+                RouterEvent::PublishMessage(message) => {
+                    for conn in self.connections.iter() {
+                        conn.use_info(|mutex| {
+                            if let Some(parameters) = mutex.connection_state.get_parameters() {
+                                let next_id = mutex.next_packet_id();
+                                let encrypted_message = EncryptedMessage::new_from_message(next_id, &message, &parameters);
+
+                                if let Some(bytes) = Packet::EncryptedMessage(encrypted_message).get_bytes() {
+                                    server_events.push(ServerEvent::Packet(bytes, mutex.addr.clone()));
+                                }
+                            }
+                        });
+                    }
+                }
+
+                RouterEvent::Packet(payload) => {
+                    server_events.push(ServerEvent::Tunnel(payload));
+                }
+
+                RouterEvent::SendMessageToAddr(message, addr) => {
+                    if let Some(conn) = self.connections.get_by_addr(addr.clone()) {
+                        conn.use_info(|info| {
+                            if let Some(parameters) = info.connection_state.get_parameters() {
+                                let next_id = info.next_packet_id();
+
+                                let encrypted_message = EncryptedMessage::new_from_message(next_id, &message, &parameters);
+
+                                if let Some(bytes) = Packet::EncryptedMessage(encrypted_message).get_bytes() {
+                                    server_events.push(ServerEvent::Packet(bytes, addr));
+                                }
+                            }
+                        });
+                    }
+                }
+
+                RouterEvent::SendMessageToClient(message, id) => {
+                    if let Some(conn) = self.connections.get_by_public_key(Bytes::from(id)) {
+                        let addr = conn.addr();
+
+                        conn.use_info(|info| {
+                            if let Some(parameters) = info.connection_state.get_parameters() {
+                                let next_id = info.next_packet_id();
+                                let encrypted_message = EncryptedMessage::new_from_message(next_id, &message, &parameters);
+
+                                if let Some(bytes) = Packet::EncryptedMessage(encrypted_message).get_bytes() {
+                                    server_events.push(ServerEvent::Packet(bytes, addr));
+                                }
+                            }
+                        });
+                    }
+                }
+
+                _ => {}
+            }
+        }
+
+        self.queue.extend(server_events);
+    }
+
     fn on_tunnel(&mut self, data: Bytes) {
         use_item!(self.router, mut router => router.handle_packet(data));
     }
@@ -287,10 +478,7 @@ impl<R> Server<R>
     }
 
     fn handle_message(&mut self, message: Message, connection_info: MutexConnectionInfo) {
-        {
-            let info = connection_info.get_mutex();
-            debug_println!("Message received: {:?} from {:?}", message, info.addr);
-        }
+        debug_println!("Message received: {:?} from {:?}", message, connection_info.addr());
 
         if message.message_type == MessageType::Ethernet {
             self.queue_event(ServerEvent::Tunnel(message.payload));
@@ -298,14 +486,14 @@ impl<R> Server<R>
     }
 
     fn on_message(&mut self, encrypted_message: EncryptedMessage, connection_info: MutexConnectionInfo) {
+        println!("Got message");
         let mut parameters: Option<EncryptionParameters> = None;
 
-        {
-            let info = connection_info.get_mutex();
+        connection_info.use_info(|info| {
             if let ConnectionState::Stream(ref para) = info.connection_state {
                 parameters = Some(para.clone());
             }
-        }
+        });
 
         if let Some(parameters) = parameters {
             let message = encrypted_message.decrypt(&parameters);
@@ -318,10 +506,7 @@ impl<R> Server<R>
                 return;
             }
 
-            {
-                let mut info = connection_info.get_mutex();
-                info.bump();
-            }
+            connection_info.bump();
 
             self.handle_message(message, connection_info);
         }
@@ -332,46 +517,46 @@ impl<R> Server<R>
             return;
         }
 
-        connection_info.bump();
+        connection_info.use_info(|info| {
+            info.bump();
 
-        let mut info = connection_info.get_mutex();
+            let state = mem::replace(&mut info.connection_state, ConnectionState::Null);
 
-        let state = mem::replace(&mut info.connection_state, ConnectionState::Null);
+            info.public_key = Some(key_exchange.public_key.clone());
 
-        info.public_key = Some(key_exchange.public_key.clone());
+            self.connections.link(info.addr.clone(), key_exchange.public_key.clone());
 
-        self.connections.link(info.addr.clone(), key_exchange.public_key.clone());
+            match state {
+                ConnectionState::KeyExchange(key) => {
+                    match key_exchange.derive_encryption_parameters(key, &self.config) {
+                        None => {
+                            info.connection_state = ConnectionState::Null;
+                        }
 
-        match state {
-            ConnectionState::KeyExchange(key) => {
-                match key_exchange.derive_encryption_parameters(key, &self.config) {
-                    None => {
-                        info.connection_state = ConnectionState::Null;
-                    }
-
-                    Some(paramaters) => {
-                        info.connection_state = ConnectionState::Stream(paramaters)
+                        Some(parameters) => {
+                            info.connection_state = ConnectionState::Stream(parameters)
+                        }
                     }
                 }
-            }
 
-            _ => {
-                if let Ok((exchange, key)) = KeyExchange::new_key_exchange(&self.config) {
-                    if let Some(parameters) = key_exchange.derive_encryption_parameters(key, &self.config) {
-                        if let Some(bytes) = Packet::KeyExchange(exchange).get_bytes() {
-                            info.connection_state = ConnectionState::Stream(parameters);
-                            self.queue_event(ServerEvent::Packet(bytes, info.addr.clone()));
+                _ => {
+                    if let Ok((exchange, key)) = KeyExchange::new_key_exchange(&self.config) {
+                        if let Some(parameters) = key_exchange.derive_encryption_parameters(key, &self.config) {
+                            if let Some(bytes) = Packet::KeyExchange(exchange).get_bytes() {
+                                info.connection_state = ConnectionState::Stream(parameters);
+                                self.queue_event(ServerEvent::Packet(bytes, info.addr.clone()));
+                            } else {
+                                info.connection_state = ConnectionState::Null;
+                            }
                         } else {
                             info.connection_state = ConnectionState::Null;
                         }
                     } else {
                         info.connection_state = ConnectionState::Null;
                     }
-                } else {
-                    info.connection_state = ConnectionState::Null;
                 }
             }
-        }
+        });
     }
 
     fn get_connection_info(&mut self, addr: SocketAddr) -> MutexConnectionInfo {
@@ -390,7 +575,7 @@ impl<R> Server<R>
 
             Some(Packet::KeyExchange(key_exchange)) => {
                 let info = self.get_connection_info(addr);
-                self.handle_key_exchange(key_exchange, info );
+                self.handle_key_exchange(key_exchange, info);
             }
 
             Some(Packet::EncryptedMessage(encrypted_message)) => {
@@ -424,11 +609,14 @@ impl<R> Server<R>
             }
         }
     }
+}
 
-    pub fn connect(&mut self, addr: SocketAddr) {
+impl<R> ServerLike for Server<R>
+    where R: Router<R> + 'static {
+    fn connect(&mut self, addr: SocketAddr) {
         {
             if let Some(connection) = self.connections.get_by_addr(addr.clone()) {
-                if connection.get_mutex().connection_state.is_null() {
+                if connection.use_info(|info| info.connection_state.is_null()) {
                     return;
                 }
             }
@@ -451,12 +639,12 @@ impl<R> Server<R>
 }
 
 impl<R> Stream for Server<R>
-    where R: Router<R>  + 'static {
+    where R: Router<R> + 'static {
     type Item = ServerEvent;
     type Error = Error;
 
     fn poll(&mut self) -> Result<Async<Option<<Self as Stream>::Item>>, <Self as Stream>::Error> {
-        if self.queue.len() == 0 {
+        if !self.check_queue() {
             return Ok(Async::NotReady);
         }
 
@@ -465,7 +653,7 @@ impl<R> Stream for Server<R>
 }
 
 impl<R> Sink for Server<R>
-    where R: Router<R>  + 'static {
+    where R: Router<R> + 'static {
     type SinkItem = ServerEvent;
     type SinkError = Error;
 
@@ -474,21 +662,23 @@ impl<R> Sink for Server<R>
             return Ok(AsyncSink::NotReady(item));
         }
 
+        println!("Start on_event");
         self.on_event(item);
+        println!("End on_event");
 
         Ok(AsyncSink::Ready)
     }
 
     fn poll_complete(&mut self) -> Result<Async<()>, <Self as Sink>::SinkError> {
         if self.closed {
-            return Ok(Async::NotReady);
+            Ok(Async::NotReady)
+        } else {
+            Ok(Async::Ready(()))
         }
-
-        Ok(Async::Ready(()))
     }
 
     fn close(&mut self) -> Result<Async<()>, <Self as Sink>::SinkError> {
-        self.closed = false;
+        self.closed = true;
 
         Ok(Async::Ready(()))
     }

@@ -20,6 +20,12 @@ impl DumbRouter {
 }
 
 impl Router<DumbRouter> for DumbRouter {
+    fn queue(&mut self, event: RouterEvent) { unimplemented!() }
+
+    fn has_queue(&mut self) -> bool { unimplemented!() }
+
+    fn flush_queue(&mut self) -> Vec<RouterEvent> { unimplemented!() }
+
     fn start(&mut self) {
         unimplemented!()
     }

@@ -130,7 +130,6 @@ impl Auth {
                     }
 
                     if let (Ok(key), Ok(signature)) = (key_result, signature_result) {
-
                         return Ok(Auth::Authority(Authority {
                             key,
                             signature,
@@ -187,6 +186,121 @@ impl SharedSecret {
             signing_key: SigningKey::new(&digest::SHA512, &secret),
             secret,
         }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialOrd, PartialEq)]
+pub enum ChosenRouter {
+    Dumb,
+    #[cfg(feature = "python-router")]
+    Python,
+}
+
+static MAP: &'static [(&'static str, ChosenRouter)] = &[
+    ("dumb", ChosenRouter::Dumb),
+        #[cfg(feature = "python-router")]
+    ("python", ChosenRouter::Python),
+];
+
+impl ChosenRouter {
+    fn get_map() -> &'static [(&'static str, ChosenRouter)] {
+        &MAP
+    }
+
+    fn as_str(&self) -> &'static str {
+        for (name, token) in ChosenRouter::get_map() {
+            if *token == *self {
+                return *name;
+            }
+        }
+
+        "dumb"
+    }
+
+    fn from_str(s: String) -> Option<Self> {
+        for (name, token) in ChosenRouter::get_map() {
+            if *name == s {
+                return Some(*token);
+            }
+        }
+
+        None
+    }
+}
+
+#[derive(Debug)]
+pub struct RouterConfig {
+    pub name: ChosenRouter,
+    #[cfg(feature = "python-router")]
+    pub python: Option<PythonRouterConfig>,
+}
+
+impl RouterConfig {
+    pub fn from_value(value: &Value) -> Result<RouterConfig, Vec<String>> {
+        if let &Value::Table(ref table) = value {
+            if let Some(&Value::String(ref name)) = table.get("name") {
+                if let Some(token) = ChosenRouter::from_str(name.clone()) {
+                    return match token {
+                        ChosenRouter::Dumb => {
+                            Ok(RouterConfig {
+                                name: ChosenRouter::Dumb,
+                                #[cfg(feature = "python-router")]
+                                python: None,
+                            })
+                        }
+
+                        #[cfg(feature = "python-router")]
+                        ChosenRouter::Python => {
+                            return Ok(RouterConfig {
+                                name: ChosenRouter::Python,
+                                python: Some(PythonRouterConfig::from_value(table.get("python").unwrap_or_else(|| &Value::Boolean(false)))?),
+                            });
+                        }
+                    };
+                } else {
+                    return Err(vec![format!("router.name should be one of: {}", ChosenRouter::get_map().iter().fold("".to_string(), |acc, x| {
+                        if acc.len() == 0 {
+                            x.1.as_str().to_string()
+                        } else {
+                            format!("{}, {}", acc, x.1.as_str().to_string())
+                        }
+                    }))]);
+                }
+            }
+        }
+
+        Err(vec!["router should be a table with the key 'name'".to_string()])
+    }
+}
+
+#[cfg(feature = "python-router")]
+#[derive(Debug, Clone)]
+pub struct PythonRouterConfig {
+    pub script: String
+}
+
+#[cfg(feature = "python-router")]
+impl PythonRouterConfig {
+    pub fn from_value(value: &Value) -> Result<PythonRouterConfig, Vec<String>> {
+        match value {
+            &Value::Table(ref table) => {
+                if let Some(&Value::String(ref script)) = table.get("script") {
+                    return Ok(PythonRouterConfig {
+                        script: script.to_string(),
+                    });
+                }
+            }
+
+            &Value::String(ref script) => {
+                return Ok(PythonRouterConfig {
+                    script: script.to_string(),
+                });
+            }
+
+            _ => {}
+        }
+
+        Err(vec!["router.python needs to be a string or a table with the key 'script' pointing to the python router script".to_string()])
     }
 }
 
@@ -345,6 +459,7 @@ pub struct Config {
     pub identity: Identity,
     pub auth: Auth,
     pub network: Network,
+    pub router: RouterConfig,
 }
 
 impl Config {
@@ -356,6 +471,8 @@ impl Config {
                 let mut auth: Option<Auth> = None;
                 let mut identity: Option<Identity> = None;
                 let mut network: Option<Network> = None;
+                let mut router: Option<RouterConfig> = None;
+
                 let mut has_errors: bool = false;
                 if table.contains_key("auth") {
                     match Auth::from_value(&table["auth"]) {
@@ -405,8 +522,22 @@ impl Config {
                     error_vec.push(String::from("Config is missing 'network' key"));
                 }
 
+                if let Some(ref value) = table.get("router") {
+                    match RouterConfig::from_value(value) {
+                        Ok(rou) => router = Some(rou),
+                        Err(err) => {
+                            error_vec.extend(err);
+                            has_errors = true;
+                        }
+                    }
+                } else {
+                    has_errors = true;
+                    error_vec.push(String::from("Config is missing 'router' key"));
+                }
+
                 if !has_errors {
                     return Ok(Config {
+                        router: router.unwrap(),
                         auth: auth.unwrap(),
                         identity: identity.unwrap(),
                         network: network.unwrap(),

@@ -4,7 +4,11 @@ use std::marker::PhantomData;
 use std::sync::mpsc::{Receiver, channel, Sender};
 use std::thread;
 use std::mem;
+use std::convert::TryFrom;
 use std::time::{Instant, Duration};
+use std::fs::File;
+use std::io::BufReader;
+use std::io::prelude::*;
 
 use super::super::prelude::*;
 
@@ -14,36 +18,40 @@ use pyo3::prepare_freethreaded_python;
 static mut PYTHON_ROUTER: Option<Arc<Mutex<PythonEnvironment>>> = None;
 
 pub struct PythonEnvironment {
-    queue: Vec<ServerEvent>,
+    queue: Vec<RouterEvent>,
     event_receiver: Receiver<RouterEvent>,
     event_sender: Sender<RouterEvent>,
     bw_module: PyObject,
+    imported_module: bool,
     globals: PyObject,
-    on_packet_cb: Vec<PyObject>,
-    on_message_cb: Vec<PyObject>,
+    on_packet_handlers: Vec<PyObject>,
+    on_message_handlers: Vec<PyObject>,
+}
+
+pub struct PythonExec {
+    globals: PyObject,
+}
+
+impl PythonExec {
+    fn run(self, code: &str) -> PyResult<()> {
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+
+        py.run(code, Some(self.globals.extract(py).unwrap()), None)
+    }
 }
 
 impl PythonEnvironment {
-    fn queue(&mut self, event: ServerEvent) {
-        self.queue.push(event);
-    }
-
-    fn has_queue(&self) -> bool {
-        self.queue.len() > 0
-    }
-
-    fn flush_queue(&mut self) -> Vec<ServerEvent> {
-        mem::replace(&mut self.queue, vec![])
-    }
-
     fn new() -> PythonEnvironment {
         let (event_sender, event_receiver) = channel();
 
         prepare_freethreaded_python();
         let gil = Python::acquire_gil();
         let py = gil.python();
-        let m = PyModule::new(py, "bw").unwrap();
-        let globals = PyDict::new(py);
+
+        let m = PyModule::import(py, "bw").or_else(|_| PyModule::new(py, "bw")).unwrap();
+        let object = py.eval("globals()", None, None).unwrap().to_object(py);
+        let globals: &PyDict = object.extract(py).unwrap();
 
         globals.set_item("bw", m);
 
@@ -54,9 +62,10 @@ impl PythonEnvironment {
             event_sender,
             event_receiver,
             bw_module: m.to_object(py),
+            imported_module: false,
             globals: globals.to_object(py),
-            on_packet_cb: vec![],
-            on_message_cb: vec![],
+            on_packet_handlers: vec![],
+            on_message_handlers: vec![],
         }
     }
 
@@ -67,6 +76,22 @@ impl PythonEnvironment {
         py.run(script, None, Some(self.globals.extract(py).unwrap()));
 
         Ok(())
+    }
+
+    fn get_exec(&mut self) -> PythonExec {
+        let globals = {
+            let gil = Python::acquire_gil();
+            let py = gil.python();
+            self.globals.clone_ref(py)
+        };
+
+        PythonExec {
+            globals
+        }
+    }
+
+    fn flush_queue(&mut self) -> Vec<RouterEvent> {
+        mem::replace(&mut self.queue, vec![])
     }
 }
 
@@ -85,111 +110,194 @@ router = Router()
 */
 
 pub struct PythonRouter {
-    _priv: PhantomData<()>
+    queue: Vec<RouterEvent>,
+    script: String,
 }
 
 impl PythonRouter {
-    pub fn new() -> PythonRouter {
+    pub fn new(script: String) -> PythonRouter {
         PythonRouter {
-            _priv: PhantomData,
+            queue: vec![],
+            script,
         }
+    }
+
+    fn pull_queue(&mut self) {
+        let queue = use_router(|r| -> Vec<RouterEvent> { r.flush_queue() });
+        self.queue.extend(queue);
     }
 }
 
-fn use_router<F: Fn(&mut PythonEnvironment)>(with: F) {
-    let now = Instant::now();
+fn q(event: RouterEvent) {
+    use_router(|r| r.queue.push(event));
+}
+
+fn use_router<T, F: FnOnce(&mut PythonEnvironment) -> T>(with: F) -> T {
+    let mut res = None;
+
     unsafe {
         if PYTHON_ROUTER.is_none() {
             PYTHON_ROUTER = Some(Arc::new(Mutex::new(PythonEnvironment::new())))
         }
 
         if let &Some(ref arc) = &PYTHON_ROUTER {
-            debug_println!("Asking Python Router lock");
-            use_item!(mut arc, with(&mut arc));
-            debug_println!("Releasing Python Router lock");
+            debug_println!("Python router: open");
+            res = Some(use_item!(mut arc, with(&mut arc)));
+            debug_println!("Python router: close");
         }
     }
 
-    let nower_now = Instant::now();
-
-    println!("Router actions took: {:#?}", nower_now - now);
+    return res.unwrap();
 }
 
-enum RouterEvent {
-    Message(Message),
-    Packet(Bytes),
+fn run_python_in_router(code: &str) -> PyResult<()> {
+    let mut exc = use_router(|r| -> PythonExec {
+        r.get_exec()
+    });
+
+    exc.run(code)
 }
 
 impl Router<PythonRouter> for PythonRouter {
-    fn start(&mut self) {
-        use_router(|r| {
-            r.run(r#"
-def print_some_bytes(bw, x):
-    try:
-        bw.print("Got packet with length of %d" % len(x))
-    except:
-        bw.print("Died trying to get len :( %s" % x)
+    fn queue(&mut self, event: RouterEvent) {
+        self.pull_queue();
+        self.queue.push(event);
+    }
 
-bw.add_packet_handler(print_some_bytes)
-            "#);
-        })
+    fn has_queue(&mut self) -> bool {
+        self.pull_queue();
+        self.queue.len() > 0
+    }
+
+    fn flush_queue(&mut self) -> Vec<RouterEvent> {
+        self.pull_queue();
+        mem::replace(&mut self.queue, vec![])
+    }
+
+    fn start(&mut self) {
+        run_python_in_router(r#"
+def __run_handler(bw, handler, args):
+    try:
+        handler(*args)
+    except Exception as e:
+        bw.log("Failed handler: %s, %s: %s" % (handler, type(e).__name__, e));
+"#);
+        let file = File::open(&self.script).unwrap();
+        let mut buf_reader = BufReader::new(file);
+        let mut contents = String::new();
+        buf_reader.read_to_string(&mut contents).unwrap();
+
+        run_python_in_router(&contents);
     }
 
     fn handle_message(&mut self, message: Message) {
-        use_router(|r| {
-            r.run("print('Achter')");
-            r.run("import bw\nbw.run_rust_func('Achter')");
-        })
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+        let (bw, cbs) = use_router(|r| -> (_, Vec<PyObject>) {
+            (r.bw_module.clone_ref(py), r.on_packet_handlers.iter().map(|c| c.clone_ref(py)).collect())
+        });
+
+        let bytes = PyBytes::new(py, &message.payload);
+
+        for cb in cbs {
+            cb.call1(py, (message.message_type as u8, &bytes, &bw));
+        }
     }
 
     fn handle_packet(&mut self, packet: Bytes) {
-        use_router(|r| {
-            let gil = Python::acquire_gil();
-            let py = gil.python();
-
-            let bytes = PyBytes::new(py, &packet);
-
-            let mut x = None;
-
-            for ref cb in &r.on_packet_cb {
-                x = Some(cb.call1(py, (&r.bw_module, &bytes,)));
-            }
-
-            if let Some(Err(x)) = x {
-                match x.pvalue {
-                    PyErrValue::Value(n) => {
-                        {
-                            let globals: &PyDict = r.globals.extract(py).unwrap();
-                            globals.set_item("last_error", n);
-                        }
-
-                        r.run("bw.print('Got an error: %s' % str(last_error))");
-                    },
-
-                    _ => {}
-                }
-            }
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+        let (bw, glob, cbs) = use_router(|r| -> (_, _, Vec<PyObject>) {
+            (r.bw_module.clone_ref(py), r.globals.clone_ref(py), r.on_packet_handlers.iter().map(|c| c.clone_ref(py)).collect())
         });
+
+        let bytes = PyBytes::new(py, &packet);
+
+        let dict = PyDict::new(py);
+        dict.set_item("__bw", &bw);
+        dict.set_item("__bytes", &bytes);
+
+        let globals: &PyDict = glob.extract(py).unwrap();
+
+        for cb in cbs {
+            dict.set_item("__handler", &cb);
+            py.run(r#"__run_handler(__bw, __handler, (__bytes, __bw))"#, Some(globals), Some(dict));
+        }
     }
 }
 
 #[py::modinit(bw)]
 fn init_module(py: Python, m: &PyModule) -> PyResult<()> {
-    #[pyfn(m, "print")]
-    fn print(data: String) -> PyResult<()>  {
+    #[pyfn(m, "publish_message")]
+    fn publish_message(message_type: u8, payload: Vec<u8>) -> PyResult<()> {
+        println!("Publishing message");
+        thread::spawn(move || {
+            let event = RouterEvent::PublishMessage(Message::new(MessageType::from(message_type), Bytes::from(payload)));
+            q(event);
+        });
+
+        Ok(())
+    }
+
+    #[pyfn(m, "send_message_to_address")]
+    fn send_message_to_address(message_type: u8, payload: Vec<u8>, ip: String, port: u16) -> PyResult<()> {
+        let ip = ip.parse()?;
+
+        thread::spawn(move || {
+            let addr = SocketAddr::new(ip, port);
+            let event = RouterEvent::SendMessageToAddr(Message::new(MessageType::from(message_type), Bytes::from(payload)), addr);
+            q(event);
+        });
+
+        Ok(())
+    }
+
+    #[pyfn(m, "send_message_to_client")]
+    fn send_message_to_client(message_type: u8, payload: Vec<u8>, public: Vec<u8>) -> PyResult<()> {
+        thread::spawn(move || {
+            let event = RouterEvent::SendMessageToClient(Message::new(MessageType::from(message_type), Bytes::from(payload)), public);
+            q(event);
+        });
+
+        Ok(())
+    }
+
+    #[pyfn(m, "write_packet")]
+    fn write_packet(payload: Vec<u8>) -> PyResult<()> {
+        thread::spawn(move || {
+            let event = RouterEvent::Packet(Bytes::from(payload));
+            q(event);
+        });
+
+        Ok(())
+    }
+
+    #[pyfn(m, "log")]
+    fn print(data: String) -> PyResult<()> {
         println!("From python: {}", data);
 
         Ok(())
     }
 
     #[pyfn(m, "add_message_handler")]
-    fn register_on_message(py: Python, callback: PyObject) -> PyResult<()> {
+    fn register_on_message(handler: PyObject) -> PyResult<()> {
         thread::spawn(move || {
             use_router(|r| {
                 let gil = Python::acquire_gil();
                 let py = gil.python();
 
-                r.on_message_cb.push(callback.clone_ref(py));
+                r.on_message_handlers.push(handler.clone_ref(py));
+            });
+        });
+
+        Ok(())
+    }
+
+    #[pyfn(m, "imported_bw")]
+    fn imported_bw() -> PyResult<()> {
+        thread::spawn(move || {
+            use_router(|r| {
+                r.imported_module = true;
             });
         });
 
@@ -197,14 +305,14 @@ fn init_module(py: Python, m: &PyModule) -> PyResult<()> {
     }
 
     #[pyfn(m, "add_packet_handler")]
-    fn register_on_packet(py: Python, callback: PyObject) -> PyResult<()> {
+    fn register_on_packet(handler: PyObject) -> PyResult<()> {
         thread::spawn(move || {
             debug_println!("Adding new packet handler");
             use_router(|r| {
                 let gil = Python::acquire_gil();
                 let py = gil.python();
 
-                r.on_packet_cb.push(callback.clone_ref(py));
+                r.on_packet_handlers.push(handler.clone_ref(py));
             });
         });
 
