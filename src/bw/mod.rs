@@ -41,16 +41,16 @@ pub mod macros {
 
     macro_rules! debug_println {
         () => {
-            #[cfg(debug_assertions)]
-            println!();
+            // #[cfg(debug_assertions)]
+            // println!();
         };
         ($fmt:expr) => {
-            #[cfg(debug_assertions)]
-            println!($fmt);
+            // #[cfg(debug_assertions)]
+            // println!($fmt);
         };
         ($fmt:expr, $($arg:tt)*) => {
-            #[cfg(debug_assertions)]
-            println!($fmt, $($arg)*);
+            // #[cfg(debug_assertions)]
+            // println!($fmt, $($arg)*);
         };
     }
 }

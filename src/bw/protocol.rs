@@ -15,7 +15,10 @@ use std::io::prelude::*;
 use std::io::Cursor;
 
 use crypto::chacha20::ChaCha20;
+use crypto::aes;
+use crypto::blockmodes::NoPadding;
 use crypto::symmetriccipher::SynchronousStreamCipher;
+use crypto::buffer::{ ReadBuffer, WriteBuffer, BufferResult }
 
 #[derive(Clone, Debug)]
 pub struct EncryptionParameters {
@@ -157,7 +160,7 @@ pub enum PacketType {
     EncryptedMessage,
 }
 
-
+#[inline]
 fn chacha20(key: &[u8], iv: &[u8], cipher_text: &[u8]) -> Bytes {
     let mut chacha = ChaCha20::new(key, iv);
     let mut output = BytesMut::with_capacity(cipher_text.len());
@@ -168,6 +171,25 @@ fn chacha20(key: &[u8], iv: &[u8], cipher_text: &[u8]) -> Bytes {
     chacha.process(&cipher_text, &mut output);
 
     return output.freeze();
+}
+
+#[inline]
+fn aes256cbc_enc(key: &[u8], iv: &[u8], cipher_text: &[u8]) -> Bytes {
+    let mut output = BytesMut::with_capacity(cipher_text.len());
+    unsafe {
+        output.set_len(cipher_text.len());
+    }
+
+    let encryptor = aes::cbc_encryptor(aes::KeySize::KeySize256, key, iv, NoPadding);
+
+    let mut read = RefReadBuffer::new(cipher_text);
+    let mut write_buffer = RefWriteBuffer::new(&mut output);
+
+    encryptor.encrypt(&mut read, &mut write_buffer, true);
+
+    output.truncate(write_buffer.position());
+
+    output.freeze()
 }
 
 #[derive(Debug)]
@@ -197,7 +219,9 @@ impl EncryptedMessage {
         let mut message_clone = message.clone();
         message_clone.sign(parameters);
 
-        let mut plain_text = vec![0u8; message_clone.size()];
+        let mut plain_text = BytesMut::with_capacity(message_clone.size());
+        unsafe { plain_text.set_len(message_clone.size()); }
+
         message_clone.to_bytes(&mut plain_text);
         let cipher_text = chacha20(&parameters.encryption_key, &iv, &plain_text);
 
@@ -583,7 +607,7 @@ mod test {
 
         let mut message = Message {
             compressed: false,
-            message_type: 1,
+            message_type: MessageType::Ethernet,
             payload: Bytes::from(b"Hello world!".to_vec()),
             hmac: Bytes::new(),
         };

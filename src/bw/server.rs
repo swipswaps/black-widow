@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 use std::io::Error;
 use std::mem;
+use std::fmt;
+use std::fmt::{Debug, Formatter};
 use std::u64;
 use std::sync::{Mutex, MutexGuard, Arc};
 use std::time::Instant;
@@ -15,7 +17,6 @@ use ring::agreement::{EphemeralPrivateKey, X25519, PUBLIC_KEY_MAX_LEN, agree_eph
 use ring::rand::{SecureRandom, SystemRandom};
 use ring;
 use untrusted;
-
 
 use super::prelude::*;
 
@@ -33,6 +34,16 @@ pub enum ConnectionState {
     Null,
     KeyExchange(EphemeralPrivateKey),
     Stream(EncryptionParameters),
+}
+
+impl Debug for ConnectionState {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            ConnectionState::Null => write!(f, "ConnectionState::Null"),
+            ConnectionState::KeyExchange(_) => write!(f, "ConnectionState::KeyExchange(...)"),
+            ConnectionState::Stream(x) => write!(f, "ConnectionState::Stream({:?})", x),
+        }
+    }
 }
 
 impl ConnectionState {
@@ -77,7 +88,7 @@ impl ConnectionInfo {
     }
 
     pub fn bump(&mut self) {
-        self.last_update = Instant::now();
+        // self.last_update = Instant::now();
     }
 
     pub fn next_packet_id(&mut self) -> u64 {
@@ -99,7 +110,8 @@ impl ConnectionInfo {
     }
 
     pub fn is_expired(&self) -> bool {
-        Instant::now().duration_since(self.last_update).as_secs() > 60
+        false
+        // Instant::now().duration_since(self.last_update).as_secs() > 60
     }
 }
 
@@ -119,10 +131,11 @@ impl MutexConnectionInfo {
         MutexConnectionInfo(Arc::new(Mutex::new(info)), addr)
     }
 
+    #[inline]
     pub fn use_info<T, F: FnOnce(&mut ConnectionInfo) -> T>(&self, cb: F) -> T {
-        println!("ConnectionInfo({:?}): Open", self.1);
+        debug_println!("ConnectionInfo({:?}): Open", self.1);
         let res = use_item!(self.0, mut conn => cb(&mut conn));
-        println!("ConnectionInfo({:?}): Close", self.1);
+        debug_println!("ConnectionInfo({:?}): Close", self.1);
 
         res
     }
@@ -132,7 +145,7 @@ impl MutexConnectionInfo {
     }
 
     pub fn bump(&self) {
-        self.use_info(|info| info.bump());
+        // self.use_info(|info| info.bump());
     }
 }
 
@@ -158,11 +171,13 @@ impl ConnectionCollection {
         let key = info.public_key.clone();
 
         let index = self.pointer;
-        let mutex = MutexConnectionInfo::wrap(info);
         self.pointer += 1;
-        let new_mutex = mutex.clone();
 
-        self.map.insert(index, mutex);
+        let info = MutexConnectionInfo::wrap(info);
+
+        let clone = info.clone();
+
+        self.map.insert(index, info);
 
         if let Some(old_index) = self.by_addr.remove(&addr) {
             self.remove_connection_by_pointer(old_index);
@@ -178,7 +193,7 @@ impl ConnectionCollection {
             self.by_public.insert(key.to_vec(), index);
         }
 
-        new_mutex
+        clone
     }
 
     pub fn get_by_addr(&mut self, addr: SocketAddr) -> Option<MutexConnectionInfo> {
@@ -226,9 +241,8 @@ impl ConnectionCollection {
         let mut should_remove = false;
 
         if let Some(info) = info {
-            if info.use_info(|connection| connection.is_expired()) {
+            if info.use_info(|x| x.is_expired()) {
                 self.remove_connection_by_pointer(pointer);
-
                 None
             } else {
                 Some(info)
@@ -251,7 +265,7 @@ impl ConnectionCollection {
             if let &Some(ref key) = &connection.public_key {
                 self.by_public.remove(&key.to_vec());
             }
-        });
+        })
     }
 
     fn link(&mut self, addr: SocketAddr, public: Bytes) {
@@ -324,6 +338,35 @@ impl ServerLike for RouterUnawareServer {
             router.connect(addr);
         })
     }
+
+    fn ready(&mut self) {
+        router_unaware_action!(self, r => r.ready())
+    }
+
+    fn set_interface_name(&mut self, interface_name: String) {
+        router_unaware_action!(self, router => {
+            router.set_interface_name(interface_name);
+        })
+    }
+
+    fn send_event(&mut self, event: ServerEvent) {
+        router_unaware_action!(self, router => {
+            router.send_event(event);
+        })
+    }
+
+    fn flush_queue(&mut self) -> Vec<ServerEvent> {
+        router_unaware_action!(self, router => {
+            router.flush_queue()
+        })
+    }
+
+    fn set_event_callback<F>(&mut self, callback: F) -> ()
+        where F: Fn(ServerEvent) -> () + 'static {
+        router_unaware_action!( self, router => {
+            router.set_event_callback(callback);
+        });
+    }
 }
 
 impl Stream for RouterUnawareServer {
@@ -355,14 +398,22 @@ impl Sink for RouterUnawareServer {
 pub struct Server<R>
     where R: Router<R> {
     queue: Vec<ServerEvent>,
+    interface_name: String,
     closed: bool,
     pub connections: ConnectionCollection,
     pub config: Config,
     router: Arc<Mutex<R>>,
+    callback: Option<Box<Fn(ServerEvent) -> ()>>,
 }
 
 pub trait ServerLike {
     fn connect(&mut self, addr: SocketAddr);
+    fn ready(&mut self) {}
+    fn set_interface_name(&mut self, interface_name: String);
+    fn set_event_callback<F>(&mut self, callback: F) -> ()
+        where F: Fn(ServerEvent) -> () + 'static;
+    fn send_event(&mut self, event: ServerEvent);
+    fn flush_queue(&mut self) -> Vec<ServerEvent>;
 }
 
 impl Server<DumbRouter> {
@@ -381,12 +432,38 @@ impl<R> Server<R>
             closed: false,
             connections: ConnectionCollection::new(),
             config,
+            interface_name: String::new(),
             router: Arc::new(Mutex::new(router)),
+            callback: None,
         }
     }
 
+    pub fn get_interface_name(&self) -> String {
+        self.interface_name.clone()
+    }
+
     fn queue_event(&mut self, event: ServerEvent) {
-        self.queue.push(event)
+        if let Some(ref cb) = self.callback {
+            (cb)(event);
+            return;
+        }
+
+        self.queue.push(event);
+        self.check_callback();
+    }
+
+    fn check_callback(&mut self) {
+        if self.callback.is_some() {
+            self.check_queue();
+
+            let events = self.flush_queue();
+
+            if let Some(ref cb) = self.callback {
+                for event in events {
+                    cb(event);
+                }
+            }
+        };
     }
 
     fn check_queue(&mut self) -> bool {
@@ -470,7 +547,25 @@ impl<R> Server<R>
     }
 
     fn on_tunnel(&mut self, data: Bytes) {
-        use_item!(self.router, mut router => router.handle_packet(data));
+        let message = Message::new(MessageType::Ethernet, data);
+        // use_item!(self.router, mut router => router.handle_packet(data));
+        // self.check_callback();
+        if let Some(cb) = mem::replace(&mut self.callback, None) {
+            for conn in self.connections.iter() {
+                conn.use_info(|mutex| {
+                    if let Some(parameters) = mutex.connection_state.get_parameters() {
+                        let next_id = mutex.next_packet_id();
+                        let encrypted_message = EncryptedMessage::new_from_message(next_id, &message, &parameters);
+
+                        if let Some(bytes) = Packet::EncryptedMessage(encrypted_message).get_bytes() {
+                            (cb)(ServerEvent::Packet(bytes, mutex.addr.clone()));
+                        }
+                    }
+                });
+            }
+
+            self.callback = Some(cb);
+        }
     }
 
     fn on_dht_krpc(&self, data: Bytes, addr: SocketAddr) {
@@ -486,30 +581,30 @@ impl<R> Server<R>
     }
 
     fn on_message(&mut self, encrypted_message: EncryptedMessage, connection_info: MutexConnectionInfo) {
-        println!("Got message");
-        let mut parameters: Option<EncryptionParameters> = None;
+        let message = {
+            connection_info.use_info(|info| {
+                if let ConnectionState::Stream(ref para) = info.connection_state {
+                    if let Some(message) = encrypted_message.decrypt(para) {
+                        if message.verify(para) {
+                            Some(message)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+        };
 
-        connection_info.use_info(|info| {
-            if let ConnectionState::Stream(ref para) = info.connection_state {
-                parameters = Some(para.clone());
-            }
-        });
-
-        if let Some(parameters) = parameters {
-            let message = encrypted_message.decrypt(&parameters);
-            if message.is_none() {
-                return;
-            }
-
-            let message = message.unwrap();
-            if !message.verify(&parameters) {
-                return;
-            }
-
-            connection_info.bump();
-
-            self.handle_message(message, connection_info);
+        if message.is_none() {
+            return;
         }
+
+        let message = message.unwrap();
+        self.handle_message(message, connection_info);
     }
 
     fn handle_key_exchange(&mut self, key_exchange: KeyExchange, connection_info: MutexConnectionInfo) {
@@ -526,23 +621,43 @@ impl<R> Server<R>
 
             self.connections.link(info.addr.clone(), key_exchange.public_key.clone());
 
+            debug_println!("Connection state: {:?} from: {:?}", state, info.addr.clone());
+
             match state {
                 ConnectionState::KeyExchange(key) => {
                     match key_exchange.derive_encryption_parameters(key, &self.config) {
                         None => {
+                            println!("Failed connecting to {:?}", info.addr);
                             info.connection_state = ConnectionState::Null;
                         }
 
                         Some(parameters) => {
+                            println!("Setup connection with {:?}", info.addr);
                             info.connection_state = ConnectionState::Stream(parameters)
                         }
                     }
                 }
 
-                _ => {
+                ConnectionState::Stream(x) => {
+                    if let Ok((exchange, key)) = KeyExchange::new_key_exchange(&self.config) {
+                        if let Some(bytes) = Packet::KeyExchange(exchange).get_bytes() {
+                            info.connection_state = ConnectionState::KeyExchange(key);
+                            self.queue_event(ServerEvent::Packet(bytes, info.addr.clone()));
+                        } else {
+                            info.connection_state = ConnectionState::Null;
+                        }
+                    } else {
+                        info.connection_state = ConnectionState::Null;
+                    }
+                }
+
+                ConnectionState::Null => {
+                    println!("New connection from {:?}", info.addr);
+
                     if let Ok((exchange, key)) = KeyExchange::new_key_exchange(&self.config) {
                         if let Some(parameters) = key_exchange.derive_encryption_parameters(key, &self.config) {
                             if let Some(bytes) = Packet::KeyExchange(exchange).get_bytes() {
+                                println!("Connection established with {:?}", info.addr);
                                 info.connection_state = ConnectionState::Stream(parameters);
                                 self.queue_event(ServerEvent::Packet(bytes, info.addr.clone()));
                             } else {
@@ -603,9 +718,9 @@ impl<R> Server<R>
 
             if let Ok(x) = try.parse::<SocketAddr>() {
                 self.connect(x);
-                self.queue_event(ServerEvent::Control(String::from("Ok\n")));
+                self.queue_event(ServerEvent::Control(String::from("Ok")));
             } else {
-                self.queue_event(ServerEvent::Control(String::from("No\n")));
+                self.queue_event(ServerEvent::Control(String::from("Not a valid IP")));
             }
         }
     }
@@ -616,11 +731,14 @@ impl<R> ServerLike for Server<R>
     fn connect(&mut self, addr: SocketAddr) {
         {
             if let Some(connection) = self.connections.get_by_addr(addr.clone()) {
-                if connection.use_info(|info| info.connection_state.is_null()) {
+                if !connection.use_info(|info| info.connection_state.is_null()) {
+                    println!("Already connected with {:?}", addr);
                     return;
                 }
             }
         }
+
+        println!("Trying to establish a connection with {:?}", addr);
 
         if let Ok((exchange, key)) = KeyExchange::new_key_exchange(&self.config) {
             let mut info = ConnectionInfo::new(addr.clone());
@@ -635,6 +753,30 @@ impl<R> ServerLike for Server<R>
 
             self.connections.add(info);
         }
+    }
+
+    fn ready(&mut self) {
+        use_item!( self.router, mut r => r.ready())
+    }
+
+    fn set_interface_name(&mut self, interface_name: String) {
+        use_item!( self.router, mut router => router.set_interface_name(interface_name.clone()));
+        self.interface_name = interface_name;
+    }
+
+    fn send_event(&mut self, event: ServerEvent) {
+        self.on_event(event)
+    }
+
+    fn flush_queue(&mut self) -> Vec<ServerEvent> {
+        self.check_queue();
+
+        mem::replace(&mut self.queue, vec![])
+    }
+
+    fn set_event_callback<F>(&mut self, callback: F) -> ()
+        where F: Fn(ServerEvent) -> () + 'static {
+        self.callback = Some(Box::new(callback));
     }
 }
 
@@ -662,9 +804,9 @@ impl<R> Sink for Server<R>
             return Ok(AsyncSink::NotReady(item));
         }
 
-        println!("Start on_event");
+        debug_println!("Start on_event");
         self.on_event(item);
-        println!("End on_event");
+        debug_println!("End on_event");
 
         Ok(AsyncSink::Ready)
     }

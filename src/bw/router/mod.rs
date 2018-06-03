@@ -14,9 +14,11 @@ pub trait Router<T>
     fn start(&mut self);
     fn handle_message(&mut self, message: Message);
     fn handle_packet(&mut self, packet: Bytes);
+    fn ready(&mut self) {}
     fn queue(&mut self, event: RouterEvent);
     fn has_queue(&mut self) -> bool;
     fn flush_queue(&mut self) -> Vec<RouterEvent>;
+    fn set_interface_name(&mut self, interface_name: String) {}
 }
 
 pub use self::dumb_router::DumbRouter;

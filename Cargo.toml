@@ -6,6 +6,7 @@ version = "0.1.0"
 [dependencies]
 byteorder = "1.2.2"
 bytes = "0.4.6"
+cpuprofiler = "0.0.3"
 docopt = "0.8.3"
 futures = "0.1.20"
 ring = "0.12.1"
@@ -20,7 +21,11 @@ tokio-udp = "0.1.0"
 toml = "0.4.6"
 tun-tap = "0.1.1"
 untrusted = "0.5.1"
-pyo3 = { version = "*", optional = true, features = ["python3"] }
+
+[dependencies.pyo3]
+features = ["python3"]
+optional = true
+version = "*"
 
 [dependencies.uuid]
 features = ["v4"]

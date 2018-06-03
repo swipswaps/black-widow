@@ -24,8 +24,11 @@ pub struct PythonEnvironment {
     bw_module: PyObject,
     imported_module: bool,
     globals: PyObject,
+    interface_name: String,
     on_packet_handlers: Vec<PyObject>,
     on_message_handlers: Vec<PyObject>,
+    on_boot_handlers: Vec<PyObject>,
+    on_client_handlers: Vec<PyObject>,
 }
 
 pub struct PythonExec {
@@ -33,11 +36,15 @@ pub struct PythonExec {
 }
 
 impl PythonExec {
-    fn run(self, code: &str) -> PyResult<()> {
+    fn run(self, code: &str) -> () {
         let gil = Python::acquire_gil();
         let py = gil.python();
 
-        py.run(code, Some(self.globals.extract(py).unwrap()), None)
+        if let Err(x) = py.run(code, Some(self.globals.extract(py).unwrap()), None) {
+            let dict = PyDict::new(py);
+            dict.set_item("err", x);
+            py.run("bw.print(err)", Some(self.globals.extract(py).unwrap()), Some(dict));
+        }
     }
 }
 
@@ -62,10 +69,13 @@ impl PythonEnvironment {
             event_sender,
             event_receiver,
             bw_module: m.to_object(py),
+            interface_name: String::new(),
             imported_module: false,
             globals: globals.to_object(py),
             on_packet_handlers: vec![],
             on_message_handlers: vec![],
+            on_boot_handlers: vec![],
+            on_client_handlers: vec![],
         }
     }
 
@@ -141,16 +151,16 @@ fn use_router<T, F: FnOnce(&mut PythonEnvironment) -> T>(with: F) -> T {
         }
 
         if let &Some(ref arc) = &PYTHON_ROUTER {
-            debug_println!("Python router: open");
+            // debug_println!("Python router: open");
             res = Some(use_item!(mut arc, with(&mut arc)));
-            debug_println!("Python router: close");
+            // debug_println!("Python router: close");
         }
     }
 
     return res.unwrap();
 }
 
-fn run_python_in_router(code: &str) -> PyResult<()> {
+fn run_python_in_router(code: &str) -> () {
     let mut exc = use_router(|r| -> PythonExec {
         r.get_exec()
     });
@@ -176,11 +186,14 @@ impl Router<PythonRouter> for PythonRouter {
 
     fn start(&mut self) {
         run_python_in_router(r#"
+import traceback
+
 def __run_handler(bw, handler, args):
     try:
         handler(*args)
     except Exception as e:
         bw.log("Failed handler: %s, %s: %s" % (handler, type(e).__name__, e));
+        bw.log(traceback.format_exc())
 "#);
         let file = File::open(&self.script).unwrap();
         let mut buf_reader = BufReader::new(file);
@@ -224,17 +237,63 @@ def __run_handler(bw, handler, args):
             py.run(r#"__run_handler(__bw, __handler, (__bytes, __bw))"#, Some(globals), Some(dict));
         }
     }
+
+    fn ready(&mut self) {
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+        let (bw, glob, cbs, interface_name) = use_router(|r| -> (_, _, Vec<PyObject>, _) {
+            (r.bw_module.clone_ref(py), r.globals.clone_ref(py), r.on_boot_handlers.iter().map(|c| c.clone_ref(py)).collect(), r.interface_name.clone())
+        });
+
+        let dict = PyDict::new(py);
+        dict.set_item("__bw", &bw);
+        dict.set_item("__interface_name", interface_name);
+
+        let globals: &PyDict = glob.extract(py).unwrap();
+
+        for cb in cbs {
+            dict.set_item("__handler", &cb);
+            py.run(r#"__run_handler(__bw, __handler, (__interface_name, __bw))"#, Some(globals), Some(dict));
+        }
+    }
+
+    /*fn on_client(&mut self) {
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+        let (bw, glob, cbs, interface_name) = use_router(|r| -> (_, _, Vec<PyObject>) {
+            (r.bw_module.clone_ref(py), r.globals.clone_ref(py), r.on_packet_handlers.iter().map(|c| c.clone_ref(py)).collect(), r.interface_name.clone())
+        });
+
+        let bytes = PyBytes::new(py, &packet);
+
+        let dict = PyDict::new(py);
+        dict.set_item("__bw", &bw);
+        dict.set_item("__interface_name", interface_name);
+
+        let globals: &PyDict = glob.extract(py).unwrap();
+
+        for cb in cbs {
+            dict.set_item("__handler", &cb);
+            py.run(r#"__run_handler(__bw, __handler, (__interface_name, __bw))"#, Some(globals), Some(dict));
+        }
+    }*/
+
+    fn set_interface_name(&mut self, interface_name: String) {
+        use_router(|r| {
+            r.interface_name = interface_name;
+        })
+    }
 }
 
-#[py::modinit(bw)]
+# [py::modinit(bw)]
 fn init_module(py: Python, m: &PyModule) -> PyResult<()> {
     #[pyfn(m, "publish_message")]
     fn publish_message(message_type: u8, payload: Vec<u8>) -> PyResult<()> {
-        println!("Publishing message");
-        thread::spawn(move || {
-            let event = RouterEvent::PublishMessage(Message::new(MessageType::from(message_type), Bytes::from(payload)));
-            q(event);
-        });
+        debug_println!("Publishing message");
+
+        let event = RouterEvent::PublishMessage(Message::new(MessageType::from(message_type), Bytes::from(payload)));
+        q(event);
+
 
         Ok(())
     }
@@ -243,21 +302,20 @@ fn init_module(py: Python, m: &PyModule) -> PyResult<()> {
     fn send_message_to_address(message_type: u8, payload: Vec<u8>, ip: String, port: u16) -> PyResult<()> {
         let ip = ip.parse()?;
 
-        thread::spawn(move || {
-            let addr = SocketAddr::new(ip, port);
-            let event = RouterEvent::SendMessageToAddr(Message::new(MessageType::from(message_type), Bytes::from(payload)), addr);
-            q(event);
-        });
+
+        let addr = SocketAddr::new(ip, port);
+        let event = RouterEvent::SendMessageToAddr(Message::new(MessageType::from(message_type), Bytes::from(payload)), addr);
+        q(event);
+
 
         Ok(())
     }
 
     #[pyfn(m, "send_message_to_client")]
     fn send_message_to_client(message_type: u8, payload: Vec<u8>, public: Vec<u8>) -> PyResult<()> {
-        thread::spawn(move || {
-            let event = RouterEvent::SendMessageToClient(Message::new(MessageType::from(message_type), Bytes::from(payload)), public);
-            q(event);
-        });
+        let event = RouterEvent::SendMessageToClient(Message::new(MessageType::from(message_type), Bytes::from(payload)), public);
+        q(event);
+
 
         Ok(())
     }
@@ -281,16 +339,19 @@ fn init_module(py: Python, m: &PyModule) -> PyResult<()> {
 
     #[pyfn(m, "add_message_handler")]
     fn register_on_message(handler: PyObject) -> PyResult<()> {
-        thread::spawn(move || {
-            use_router(|r| {
-                let gil = Python::acquire_gil();
-                let py = gil.python();
+        use_router(|r| {
+            let gil = Python::acquire_gil();
+            let py = gil.python();
 
-                r.on_message_handlers.push(handler.clone_ref(py));
-            });
+            r.on_message_handlers.push(handler.clone_ref(py));
         });
 
         Ok(())
+    }
+
+    #[pyfn(m, "get_interface_name")]
+    fn get_interface_name() -> PyResult<String> {
+        Ok(use_router(|r| r.interface_name.clone()))
     }
 
     #[pyfn(m, "imported_bw")]
@@ -306,14 +367,39 @@ fn init_module(py: Python, m: &PyModule) -> PyResult<()> {
 
     #[pyfn(m, "add_packet_handler")]
     fn register_on_packet(handler: PyObject) -> PyResult<()> {
-        thread::spawn(move || {
-            debug_println!("Adding new packet handler");
-            use_router(|r| {
-                let gil = Python::acquire_gil();
-                let py = gil.python();
+        debug_println!("Adding new packet handler");
+        use_router(|r| {
+            let gil = Python::acquire_gil();
+            let py = gil.python();
 
-                r.on_packet_handlers.push(handler.clone_ref(py));
-            });
+            r.on_packet_handlers.push(handler.clone_ref(py));
+        });
+
+
+        Ok(())
+    }
+
+    #[pyfn(m, "add_boot_handler")]
+    fn register_on_boot(handler: PyObject) -> PyResult<()> {
+        debug_println!("Adding new boot handler");
+        use_router(|r| {
+            let gil = Python::acquire_gil();
+            let py = gil.python();
+
+            r.on_boot_handlers.push(handler.clone_ref(py));
+        });
+
+        Ok(())
+    }
+
+    #[pyfn(m, "add_client_handler")]
+    fn register_on_client(handler: PyObject) -> PyResult<()> {
+        debug_println!("Adding new client handler");
+        use_router(|r| {
+            let gil = Python::acquire_gil();
+            let py = gil.python();
+
+            r.on_client_handlers.push(handler.clone_ref(py));
         });
 
         Ok(())
