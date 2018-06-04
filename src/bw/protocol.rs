@@ -18,7 +18,7 @@ use crypto::chacha20::ChaCha20;
 use crypto::aes;
 use crypto::blockmodes::NoPadding;
 use crypto::symmetriccipher::SynchronousStreamCipher;
-use crypto::buffer::{ ReadBuffer, WriteBuffer, BufferResult }
+use crypto::buffer::{ReadBuffer, WriteBuffer, BufferResult, RefReadBuffer, RefWriteBuffer};
 
 #[derive(Clone, Debug)]
 pub struct EncryptionParameters {
@@ -180,14 +180,18 @@ fn aes256cbc_enc(key: &[u8], iv: &[u8], cipher_text: &[u8]) -> Bytes {
         output.set_len(cipher_text.len());
     }
 
-    let encryptor = aes::cbc_encryptor(aes::KeySize::KeySize256, key, iv, NoPadding);
+    let mut encryptor = aes::cbc_encryptor(aes::KeySize::KeySize256, key, iv, NoPadding);
 
     let mut read = RefReadBuffer::new(cipher_text);
-    let mut write_buffer = RefWriteBuffer::new(&mut output);
+    let position = {
+        let mut write_buffer = RefWriteBuffer::new(&mut output);
 
-    encryptor.encrypt(&mut read, &mut write_buffer, true);
+        encryptor.encrypt(&mut read, &mut write_buffer, true);
+        write_buffer.position()
+    };
 
-    output.truncate(write_buffer.position());
+
+    output.truncate(position);
 
     output.freeze()
 }
@@ -213,7 +217,7 @@ impl EncryptedMessage {
     }
 
     pub fn new_from_message(packet_id: u64, message: &Message, parameters: &EncryptionParameters) -> EncryptedMessage {
-        let mut iv = vec![0; 12];
+        let mut iv = [0; 12];
         SystemRandom::new().fill(&mut iv);
 
         let mut message_clone = message.clone();
@@ -226,7 +230,7 @@ impl EncryptedMessage {
         let cipher_text = chacha20(&parameters.encryption_key, &iv, &plain_text);
 
         EncryptedMessage {
-            iv: Bytes::from(iv),
+            iv: Bytes::from(&iv[..]),
             cipher_text,
             packet_id,
         }
@@ -440,7 +444,7 @@ impl KeyExchange {
                     return false;
                 }
 
-                if let Err(_) = verify_with_own_key(&secret.signing_key, &self.ephemeral_key, &self.proof) {
+                if let Err(_) = verify_with_own_key(&secret.get_signing_key(), &self.ephemeral_key, &self.proof) {
                     return false;
                 }
             }
@@ -494,7 +498,7 @@ impl KeyExchange {
                 proof: {
                     match &config.auth {
                         &Auth::SharedSecret(ref secret) => {
-                            Bytes::from(sign(&secret.signing_key, &ephemeral_public_key).as_ref())
+                            Bytes::from(sign(&secret.get_signing_key(), &ephemeral_public_key).as_ref())
                         }
 
                         &Auth::Authority(ref auth) => {

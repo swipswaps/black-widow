@@ -12,6 +12,8 @@ use uuid::Uuid;
 
 use untrusted::Input;
 
+use tun_tap::Mode;
+
 use ring::digest;
 use ring::hmac::SigningKey;
 use ring::signature::{Ed25519KeyPair, ED25519};
@@ -75,7 +77,7 @@ fn parse_file_or_value(value: &Value, path: &str, default_is_path: bool) -> Resu
     Err(error_vec)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Auth {
     SharedSecret(SharedSecret),
     Authority(Authority),
@@ -163,15 +165,17 @@ impl Auth {
     }
 }
 
-#[derive(Debug)]
+
+
+#[derive(Debug, Clone)]
 pub struct Authority {
     pub key: Bytes,
     pub signature: Bytes,
 }
 
+#[derive(Clone)]
 pub struct SharedSecret {
     pub secret: Bytes,
-    pub signing_key: SigningKey,
 }
 
 impl Debug for SharedSecret {
@@ -181,9 +185,12 @@ impl Debug for SharedSecret {
 }
 
 impl SharedSecret {
+    pub fn get_signing_key(&self) -> SigningKey {
+        SigningKey::new(&digest::SHA512, &self.secret)
+    }
+
     pub fn new(secret: Bytes) -> SharedSecret {
         SharedSecret {
-            signing_key: SigningKey::new(&digest::SHA512, &secret),
             secret,
         }
     }
@@ -228,7 +235,62 @@ impl ChosenRouter {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub struct Interface {
+    pub name: String,
+    pub mode: Mode,
+    pub mtu: u16,
+}
+
+impl Interface {
+    pub fn from_value(value: &Value) -> Result<Interface, Vec<String>> {
+        if let &Value::Table(ref table) = value {
+            let mut name = String::from("bw%d");
+            let mut mode = Mode::Tun;
+            let mut mtu = 1400;
+
+            if let Some(&Value::String(ref config_name)) = table.get("name") {
+                name = config_name.clone();
+            }
+
+            if let Some(&Value::String(ref config_mode)) = table.get("mode") {
+                let config_mode = config_mode.clone();
+
+                match config_mode.as_str() {
+                    "tun" => {
+                        mode = Mode::Tun;
+                    }
+
+                    "tap" => {
+                        mode = Mode::Tap;
+                    }
+
+                    x => {
+                        return Err(vec![format!("interface.mode should be 'tun' or 'tap'; '{}' given", x)])
+                    }
+                }
+            }
+
+            if let Some(&Value::Integer(ref number)) = table.get("mtu") {
+                if *number > 65535 || *number <= 0 {
+                    return Err(vec![format!("interface.mtu should be between 0 and 65535; '{}' given", *number)])
+                }
+
+                mtu = *number as u16;
+            }
+
+            Ok(Interface {
+                mtu,
+                name,
+                mode
+            })
+        } else {
+            Err(vec!["interface should be a table with the keys name, mode and mtu".to_string()])
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct RouterConfig {
     pub name: ChosenRouter,
     #[cfg(feature = "python-router")]
@@ -303,11 +365,10 @@ impl PythonRouterConfig {
         Err(vec!["router.python needs to be a string or a table with the key 'script' pointing to the python router script".to_string()])
     }
 }
-
+#[derive(Clone)]
 pub struct Identity {
     pub key: Bytes,
     pub name: Option<String>,
-    pub key_pair: Ed25519KeyPair,
     pub public_key: Bytes,
 }
 
@@ -318,8 +379,12 @@ impl Debug for Identity {
 }
 
 impl Identity {
+    pub fn get_key_pair(&self) -> Ed25519KeyPair {
+        Ed25519KeyPair::from_seed_unchecked(Input::from(&self.key.clone())).unwrap()
+    }
+
     pub fn sign(&self, msg: &[u8]) -> Bytes {
-        return Bytes::from(self.key_pair.sign(msg).as_ref());
+        return Bytes::from(self.get_key_pair().sign(msg).as_ref());
     }
 
     pub fn from_value(value: &Value) -> Result<Identity, Vec<String>> {
@@ -361,11 +426,11 @@ impl Identity {
 
                 if !has_errors {
                     let key_pair = Ed25519KeyPair::from_seed_unchecked(Input::from(&key.clone())).unwrap();
+
                     return Ok(Identity {
                         name,
                         key,
                         public_key: Bytes::from(key_pair.public_key_bytes()),
-                        key_pair,
                     });
                 }
             }
@@ -379,6 +444,40 @@ impl Identity {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ServerConfig {
+    pub threads: u16
+}
+
+impl ServerConfig {
+    pub fn from_value(value: &Value) -> Result<ServerConfig, Vec<String>> {
+        match value {
+            &Value::Table(ref table) => {
+                let mut threads = 2;
+
+                if let Some(&Value::Integer(ref num)) = table.get("name") {
+                    let num = *num;
+
+                    if num < 1 || num > 65535 {
+                        return Err(vec!["server.threads needs to be between 1 and 65535".to_string()])
+                    }
+
+                    threads = num as u16;
+                }
+
+                Ok(ServerConfig {
+                    threads
+                })
+            }
+
+            _ => {
+                Err(vec!["server needs to be a table with the key threads".to_string()])
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Network {
     pub id: [u8; 20],
     pub code: Option<String>,
@@ -454,9 +553,11 @@ impl Debug for Network {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Config {
     pub identity: Identity,
+    pub interface: Interface,
+    pub server: ServerConfig,
     pub auth: Auth,
     pub network: Network,
     pub router: RouterConfig,
@@ -472,6 +573,15 @@ impl Config {
                 let mut identity: Option<Identity> = None;
                 let mut network: Option<Network> = None;
                 let mut router: Option<RouterConfig> = None;
+                let mut interface = Interface {
+                    mtu: 1400,
+                    mode: Mode::Tun,
+                    name: "bw%d".to_string()
+                };
+
+                let mut server = ServerConfig {
+                    threads: 4,
+                };
 
                 let mut has_errors: bool = false;
                 if table.contains_key("auth") {
@@ -488,6 +598,32 @@ impl Config {
                 } else {
                     has_errors = true;
                     error_vec.push(String::from("Config is missing 'auth' key"));
+                }
+
+                if table.contains_key("interface") {
+                    match Interface::from_value(&table["interface"]) {
+                        Ok(interf) => {
+                            interface = interf;
+                        }
+
+                        Err(err) => {
+                            error_vec.extend(err);
+                            has_errors = true;
+                        }
+                    }
+                }
+
+                if table.contains_key("interface") {
+                    match ServerConfig::from_value(&table["server"]) {
+                        Ok(serv) => {
+                            server = serv;
+                        }
+
+                        Err(err) => {
+                            error_vec.extend(err);
+                            has_errors = true;
+                        }
+                    }
                 }
 
                 if table.contains_key("identity") {
@@ -538,6 +674,8 @@ impl Config {
                 if !has_errors {
                     return Ok(Config {
                         router: router.unwrap(),
+                        interface,
+                        server,
                         auth: auth.unwrap(),
                         identity: identity.unwrap(),
                         network: network.unwrap(),

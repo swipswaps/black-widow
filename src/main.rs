@@ -20,6 +20,8 @@ extern crate tokio;
 extern crate tokio_core;
 extern crate futures;
 
+extern crate multiqueue;
+
 #[macro_use]
 pub mod bw;
 
@@ -38,10 +40,23 @@ use std::sync::mpsc::channel;
 use std::io::prelude::*;
 use std::io::{Stdin, Stdout, stdin, stdout};
 use std::process::exit;
+use std::process::Command;
 use std::borrow::Cow;
 use std::mem;
 
 use bytes::Bytes;
+
+use multiqueue::mpmc_queue;
+
+fn cmd(cmd: &str, args: &[&str]) {
+    let ecode = Command::new(cmd)
+        .args(args)
+        .spawn()
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert!(ecode.success(), "Failed to execte {}", cmd);
+}
 
 fn get_config() -> Result<Config, Vec<String>> {
     let mut config = File::open("config/example_secret.toml").unwrap();
@@ -73,27 +88,29 @@ fn main() {
     println!("Working with config: {:#?}", config);
 
     let core = Core::new().unwrap();
-    let iface = Iface::new("bw%d", Mode::Tun).unwrap();
+    let iface = Iface::new(config.interface.name.as_str(), config.interface.mode).unwrap();
     let name = iface.name().to_string();
+
+    cmd("ip", &["link", "set", iface.name(), "mtu", format!("{}", config.interface.mtu).as_str()]);
+
     let mut socket = UdpSocket::bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0)).unwrap();
     println!("Listening on {:?}", socket.local_addr().unwrap());
 
+
     let runtime = core.remote();
     let (all_sender, all_receiver) = channel();
+    let (server_sender, server_receiver) = mpmc_queue::<ServerEvent>(1000);
 
-    // let mut server = Server::new(config);
-    let mut server = Server::new(config);
+    let thread_cnt = config.server.threads;
+
+    let mut server = RouterUnawareServer::new(config);
     server.set_interface_name(name.to_string());
 
     let all_writer = all_sender.clone();
 
-    server.set_event_callback(move |event| {
-        all_writer.send(event);
-    });
+    server.set_sender(all_writer);
 
     server.ready();
-
-    let (server_sender, server_receiver) = channel();
 
     let iface = Arc::new(iface);
     let iface_writer = Arc::clone(&iface);
@@ -102,21 +119,10 @@ fn main() {
 
     let iface_reader = spawn_named("interface listener", move || {
         let mut x = vec![0u8; 1700];
-        let mut amount = 0;
-        let mut amount_now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
         loop {
-            /* let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-
-            if now != amount_now {
-                println!("read {} packets in 1s", amount);
-                amount = 0;
-                amount_now = now;
-            } */
-
             if let Ok(size) = iface_reader.recv(&mut x) {
-            //    amount += 1;
-                server_writer.send(ServerEvent::Tunnel(Bytes::from(&x[..size])));
+                server_writer.try_send(ServerEvent::Tunnel(Bytes::from(&x[..size])));
             }
         }
     });
@@ -131,7 +137,7 @@ fn main() {
 
         loop {
             if let Ok((size, from)) = udp_reader.recv_from(&mut x) {
-                server_writer.send(ServerEvent::Packet(Bytes::from(&x[..size]), from));
+                server_writer.try_send(ServerEvent::Packet(Bytes::from(&x[..size]), from));
             }
         }
     });
@@ -141,7 +147,7 @@ fn main() {
         let mut input = String::new();
         loop {
             if let Ok(size) = stdin().read_line(&mut input) {
-                server_writer.send(ServerEvent::Control(input[..size].to_string()));
+                server_writer.try_send(ServerEvent::Control(input[..size].to_string()));
                 input = String::new();
             }
         }
@@ -152,14 +158,6 @@ fn main() {
         let mut amount_now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
         loop {
-            /*let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-
-            if now != amount_now {
-                println!("Written {} packets in 1s", amount);
-                amount = 0;
-                amount_now = now;
-            }*/
-
             if let Ok(event) = all_receiver.recv() {
                 match event {
                     ServerEvent::Packet(data, addr) => {
@@ -167,7 +165,6 @@ fn main() {
                     }
 
                     ServerEvent::Tunnel(data) => {
-                        // amount += 1;
                         iface_writer.send(data.as_ref());
                     }
 
@@ -182,58 +179,29 @@ fn main() {
     let mut count: [Vec<u64>; 3] = [vec![], vec![], vec![]];
     let mut last = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
-    loop {
-        /*
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let mut threads = vec![];
 
-        if now != last {
-            let counters = mem::replace(&mut count, [vec![], vec![], vec![]]);
 
-            let mut index = 0;
-            for numbers in counters.iter() {
-                let mut lowest = std::u64::MAX;
-                let mut highest = 0;
-                let mut total: f64 = 0f64;
+    println!("Starting {} digestion threads", thread_cnt);
 
-                let len: f64 = numbers.len() as f64;
-
-                for num in numbers {
-                    let number = *num;
-                    total += number as f64;
-
-                    if lowest > number {
-                        lowest = number;
-                    }
-
-                    if highest < number {
-                        highest = number;
-                    }
+    for i in 0..thread_cnt {
+        let serv_recv = server_receiver.clone();
+        let server_clone = server.clone();
+        threads.push(spawn_named(&format!("server digestion {}", 1), move || {
+            loop {
+                if let Ok(event) = serv_recv.recv() {
+                    server_clone.send_event(event);
+                } else {
+                    sleep(Duration::from_micros(100));
                 }
-
-                println!("{} | l: {} h: {} a: {} c: {}", index, lowest, highest, total / len, len);
-                index += 1;
             }
+        }));
+    }
 
-            last = now;
-        }*/
+    server_receiver.unsubscribe();
 
-        if let Ok(event) = server_receiver.recv() {
-            /*
-            let index = match event {
-                ServerEvent::Control(_) => 2,
-                ServerEvent::Packet(_, _) => 1,
-                ServerEvent::Tunnel(_) => 0,
-            };
-
-            let start = Instant::now();
-*/
-            server.send_event(event);
-  /*          let end = Instant::now();
-            let duration = (end - start);
-
-
-            count[index].push((duration.as_secs() * 1_000_000_000) + duration.subsec_nanos() as u64);*/
-        }
+    for thread in threads {
+        thread.join().unwrap();
     }
 
     iface_reader.join().unwrap();

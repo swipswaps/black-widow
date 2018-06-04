@@ -1,7 +1,10 @@
+use super::super::prelude::*;
+
 use std::net::{SocketAddr, IpAddr};
 use std::sync::{Mutex, Arc};
 use std::marker::PhantomData;
 use std::sync::mpsc::{Receiver, channel, Sender};
+use multiqueue::{MPMCSender, mpmc_queue};
 use std::thread;
 use std::mem;
 use std::convert::TryFrom;
@@ -10,17 +13,13 @@ use std::fs::File;
 use std::io::BufReader;
 use std::io::prelude::*;
 
-use super::super::prelude::*;
-
 use pyo3::prelude::*;
 use pyo3::prepare_freethreaded_python;
 
 static mut PYTHON_ROUTER: Option<Arc<Mutex<PythonEnvironment>>> = None;
 
 pub struct PythonEnvironment {
-    queue: Vec<RouterEvent>,
-    event_receiver: Receiver<RouterEvent>,
-    event_sender: Sender<RouterEvent>,
+    remote: Option<ServerRemote>,
     bw_module: PyObject,
     imported_module: bool,
     globals: PyObject,
@@ -43,15 +42,14 @@ impl PythonExec {
         if let Err(x) = py.run(code, Some(self.globals.extract(py).unwrap()), None) {
             let dict = PyDict::new(py);
             dict.set_item("err", x);
-            py.run("bw.print(err)", Some(self.globals.extract(py).unwrap()), Some(dict));
+            println!("Failed running python code");
+            py.run("bw.log(err)", Some(self.globals.extract(py).unwrap()), Some(dict));
         }
     }
 }
 
 impl PythonEnvironment {
     fn new() -> PythonEnvironment {
-        let (event_sender, event_receiver) = channel();
-
         prepare_freethreaded_python();
         let gil = Python::acquire_gil();
         let py = gil.python();
@@ -65,9 +63,7 @@ impl PythonEnvironment {
         init_module(py, m);
 
         PythonEnvironment {
-            queue: vec![],
-            event_sender,
-            event_receiver,
+            remote: None,
             bw_module: m.to_object(py),
             interface_name: String::new(),
             imported_module: false,
@@ -88,6 +84,10 @@ impl PythonEnvironment {
         Ok(())
     }
 
+    fn set_remote(&mut self, remote: ServerRemote) {
+        self.remote = Some(remote);
+    }
+
     fn get_exec(&mut self) -> PythonExec {
         let globals = {
             let gil = Python::acquire_gil();
@@ -99,47 +99,19 @@ impl PythonEnvironment {
             globals
         }
     }
-
-    fn flush_queue(&mut self) -> Vec<RouterEvent> {
-        mem::replace(&mut self.queue, vec![])
-    }
 }
 
-/**
-class Router:
-    def on_message(self, message):
-        pass
-
-    def on_packet(self, packet):
-        pass
-
-    def start(self, packet):
-        pass
-
-router = Router()
-*/
-
+#[derive(Clone)]
 pub struct PythonRouter {
-    queue: Vec<RouterEvent>,
     script: String,
 }
 
 impl PythonRouter {
     pub fn new(script: String) -> PythonRouter {
         PythonRouter {
-            queue: vec![],
             script,
         }
     }
-
-    fn pull_queue(&mut self) {
-        let queue = use_router(|r| -> Vec<RouterEvent> { r.flush_queue() });
-        self.queue.extend(queue);
-    }
-}
-
-fn q(event: RouterEvent) {
-    use_router(|r| r.queue.push(event));
 }
 
 fn use_router<T, F: FnOnce(&mut PythonEnvironment) -> T>(with: F) -> T {
@@ -151,13 +123,21 @@ fn use_router<T, F: FnOnce(&mut PythonEnvironment) -> T>(with: F) -> T {
         }
 
         if let &Some(ref arc) = &PYTHON_ROUTER {
-            // debug_println!("Python router: open");
             res = Some(use_item!(mut arc, with(&mut arc)));
-            // debug_println!("Python router: close");
         }
     }
 
     return res.unwrap();
+}
+
+fn use_remote<T, F: FnOnce(&ServerRemote) -> T>(f: F) -> Option<T> {
+    use_router(|r| {
+        if let Some(ref remote) = r.remote {
+            Some(f(remote))
+        } else {
+            None
+        }
+    })
 }
 
 fn run_python_in_router(code: &str) -> () {
@@ -169,21 +149,6 @@ fn run_python_in_router(code: &str) -> () {
 }
 
 impl Router<PythonRouter> for PythonRouter {
-    fn queue(&mut self, event: RouterEvent) {
-        self.pull_queue();
-        self.queue.push(event);
-    }
-
-    fn has_queue(&mut self) -> bool {
-        self.pull_queue();
-        self.queue.len() > 0
-    }
-
-    fn flush_queue(&mut self) -> Vec<RouterEvent> {
-        self.pull_queue();
-        mem::replace(&mut self.queue, vec![])
-    }
-
     fn start(&mut self) {
         run_python_in_router(r#"
 import traceback
@@ -203,21 +168,33 @@ def __run_handler(bw, handler, args):
         run_python_in_router(&contents);
     }
 
-    fn handle_message(&mut self, message: Message) {
+    fn handle_message(&self, message: Message, addr: SocketAddr, id: Bytes) {
         let gil = Python::acquire_gil();
         let py = gil.python();
-        let (bw, cbs) = use_router(|r| -> (_, Vec<PyObject>) {
-            (r.bw_module.clone_ref(py), r.on_packet_handlers.iter().map(|c| c.clone_ref(py)).collect())
+        let (bw, cbs, glob) = use_router(|r| -> (_, Vec<PyObject>, _) {
+            (r.bw_module.clone_ref(py), r.on_message_handlers.iter().map(|c| c.clone_ref(py)).collect(), r.globals.clone_ref(py))
         });
 
         let bytes = PyBytes::new(py, &message.payload);
+        let id = PyBytes::new(py, &id);
+
+        let dict = PyDict::new(py);
+        dict.set_item("__bw", &bw);
+        dict.set_item("__type", message.message_type as u8);
+        dict.set_item("__bytes", &bytes);
+        dict.set_item("__ip", format!("{}", addr.ip()));
+        dict.set_item("__port", addr.port());
+        dict.set_item("__id", &id);
+
+        let globals: &PyDict = glob.extract(py).unwrap();
 
         for cb in cbs {
-            cb.call1(py, (message.message_type as u8, &bytes, &bw));
+            dict.set_item("__handler", &cb);
+            py.run(r#"__run_handler(__bw, __handler, (__type, __bytes, __ip, __port, __id))"#, Some(globals), Some(dict));
         }
     }
 
-    fn handle_packet(&mut self, packet: Bytes) {
+    fn handle_packet(&self, packet: Bytes) {
         let gil = Python::acquire_gil();
         let py = gil.python();
         let (bw, glob, cbs) = use_router(|r| -> (_, _, Vec<PyObject>) {
@@ -234,14 +211,17 @@ def __run_handler(bw, handler, args):
 
         for cb in cbs {
             dict.set_item("__handler", &cb);
-            py.run(r#"__run_handler(__bw, __handler, (__bytes, __bw))"#, Some(globals), Some(dict));
+            py.run(r#"__run_handler(__bw, __handler, (__bytes,))"#, Some(globals), Some(dict));
         }
     }
 
-    fn ready(&mut self) {
+    fn ready(&mut self, remote: ServerRemote) {
+        println!("Running ready handlers");
         let gil = Python::acquire_gil();
         let py = gil.python();
         let (bw, glob, cbs, interface_name) = use_router(|r| -> (_, _, Vec<PyObject>, _) {
+            r.set_remote(remote);
+
             (r.bw_module.clone_ref(py), r.globals.clone_ref(py), r.on_boot_handlers.iter().map(|c| c.clone_ref(py)).collect(), r.interface_name.clone())
         });
 
@@ -253,30 +233,32 @@ def __run_handler(bw, handler, args):
 
         for cb in cbs {
             dict.set_item("__handler", &cb);
-            py.run(r#"__run_handler(__bw, __handler, (__interface_name, __bw))"#, Some(globals), Some(dict));
+            py.run(r#"__run_handler(__bw, __handler, (__interface_name,))"#, Some(globals), Some(dict));
         }
     }
 
-    /*fn on_client(&mut self) {
+    fn handle_new_client(&self, addr: SocketAddr, id: Bytes) {
         let gil = Python::acquire_gil();
         let py = gil.python();
-        let (bw, glob, cbs, interface_name) = use_router(|r| -> (_, _, Vec<PyObject>) {
-            (r.bw_module.clone_ref(py), r.globals.clone_ref(py), r.on_packet_handlers.iter().map(|c| c.clone_ref(py)).collect(), r.interface_name.clone())
+        let (bw, glob, cbs) = use_router(|r| -> (_, _, Vec<PyObject>) {
+            (r.bw_module.clone_ref(py), r.globals.clone_ref(py), r.on_client_handlers.iter().map(|c| c.clone_ref(py)).collect())
         });
 
-        let bytes = PyBytes::new(py, &packet);
+        let id = PyBytes::new(py, &id);
 
         let dict = PyDict::new(py);
         dict.set_item("__bw", &bw);
-        dict.set_item("__interface_name", interface_name);
+        dict.set_item("__ip", format!("{}", addr.ip()));
+        dict.set_item("__port", addr.port());
+        dict.set_item("__id", &id);
 
         let globals: &PyDict = glob.extract(py).unwrap();
 
         for cb in cbs {
             dict.set_item("__handler", &cb);
-            py.run(r#"__run_handler(__bw, __handler, (__interface_name, __bw))"#, Some(globals), Some(dict));
+            py.run(r#"__run_handler(__bw, __handler, (__ip, __port, __id))"#, Some(globals), Some(dict));
         }
-    }*/
+    }
 
     fn set_interface_name(&mut self, interface_name: String) {
         use_router(|r| {
@@ -290,10 +272,9 @@ fn init_module(py: Python, m: &PyModule) -> PyResult<()> {
     #[pyfn(m, "publish_message")]
     fn publish_message(message_type: u8, payload: Vec<u8>) -> PyResult<()> {
         debug_println!("Publishing message");
+        let message = Message::new(MessageType::from(message_type), Bytes::from(payload));
 
-        let event = RouterEvent::PublishMessage(Message::new(MessageType::from(message_type), Bytes::from(payload)));
-        q(event);
-
+        use_remote(|r| r.publish_message(message));
 
         Ok(())
     }
@@ -304,17 +285,19 @@ fn init_module(py: Python, m: &PyModule) -> PyResult<()> {
 
 
         let addr = SocketAddr::new(ip, port);
-        let event = RouterEvent::SendMessageToAddr(Message::new(MessageType::from(message_type), Bytes::from(payload)), addr);
-        q(event);
+        let message = Message::new(MessageType::from(message_type), Bytes::from(payload));
 
+        use_remote(|r| r.send_message_to_addr(message, addr));
 
         Ok(())
     }
 
     #[pyfn(m, "send_message_to_client")]
     fn send_message_to_client(message_type: u8, payload: Vec<u8>, public: Vec<u8>) -> PyResult<()> {
-        let event = RouterEvent::SendMessageToClient(Message::new(MessageType::from(message_type), Bytes::from(payload)), public);
-        q(event);
+        let message = Message::new(MessageType::from(message_type), Bytes::from(payload));
+        let id = Bytes::from(public);
+
+        use_remote(|r| r.send_message_to_client(message, id));
 
 
         Ok(())
@@ -322,10 +305,8 @@ fn init_module(py: Python, m: &PyModule) -> PyResult<()> {
 
     #[pyfn(m, "write_packet")]
     fn write_packet(payload: Vec<u8>) -> PyResult<()> {
-        thread::spawn(move || {
-            let event = RouterEvent::Packet(Bytes::from(payload));
-            q(event);
-        });
+        let packet = Bytes::from(payload);
+        use_remote(|r| r.write_packet(packet));
 
         Ok(())
     }

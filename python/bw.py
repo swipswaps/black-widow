@@ -64,7 +64,6 @@ def add_packet_handler(handler):
 
     :param handler: The handler which should be called when a packet is received
     :type handler: Callable[[bytes], Any]
-    :type pass_module: bool
     """
 
     pass
@@ -75,7 +74,27 @@ def add_message_handler(handler):
     Add a message handler to the handler stack
 
     :param handler: The handler which should be called when a message is received
-    :type handler: Callable[[int, bytes, str, int], Any]
+    :type handler: Callable[[int, bytes, str, int, bytes], Any]
+    """
+    pass
+
+
+def add_client_handler(handler):
+    """
+    Add a new client handler to the handler stack
+
+    :param handler: The handler which should be called when a new client connected, given parameters are ip, port and id
+    :type handler: Callable[[str, int, bytes], Any]
+    """
+    pass
+
+
+def add_boot_handler(handler):
+    """
+    Add a new boot handler to the handler stack
+
+    :param handler: The handler which should be called when the router is ready, given parameter is the interface name
+    :type handler: Callable[[str], Any]
     """
     pass
 
@@ -93,7 +112,10 @@ __ALL__ = [
     publish_message,
     add_message_handler,
     add_packet_handler,
+    add_boot_handler,
+    add_client_handler,
     send_message_to_address,
     send_message_to_client,
-    write_packet
+    write_packet,
+    log
 ]
