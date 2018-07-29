@@ -20,17 +20,24 @@ tokio-core = "0.1.16"
 tokio-io = "0.1.6"
 tokio-udp = "0.1.0"
 toml = "0.4.6"
-tun-tap = "0.1.1"
 untrusted = "0.5.1"
+
+[dependencies.tun-tap]
+git = "https://github.com/the-eater/tuntap"
+branch = "feature/allow_no_packet_info"
+
+[dependencies.nix]
+version = "0.11.0"
+optional = true
 
 [dependencies.pyo3]
 features = ["python3"]
 optional = true
-version = "*"
+version = "0.3"
 
 [dependencies.uuid]
 features = ["v4"]
 version = "0.6.2"
 
 [features]
-python-router = ["pyo3"]
+python-router = ["pyo3", "nix"]

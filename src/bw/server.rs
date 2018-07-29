@@ -273,13 +273,20 @@ impl ConnectionCollection {
     }
 }
 
+#[cfg(feature = "python-router")]
 #[derive(Clone)]
 pub enum RouterUnawareServer {
-    #[cfg(feature = "python-router")]
     PythonRouter(Server<PythonRouter>),
     DumbRouter(Server<DumbRouter>),
 }
 
+#[cfg(not(feature = "python-router"))]
+#[derive(Clone)]
+pub enum RouterUnawareServer {
+    DumbRouter(Server<DumbRouter>),
+}
+
+#[cfg(feature = "python-router")]
 macro_rules! router_unaware_action {
     ($on:ident, $name:tt => $action:expr) => {
         match $on {
@@ -287,7 +294,17 @@ macro_rules! router_unaware_action {
                 $action
             },
 
-            #[cfg(feature = "python-router")]
+            RouterUnawareServer::DumbRouter($name) => {
+                $action
+            },
+        }
+    };
+}
+
+#[cfg(not(feature = "python-router"))]
+macro_rules! router_unaware_action {
+    ($on:ident, $name:tt => $action:expr) => {
+        match $on {
             RouterUnawareServer::DumbRouter($name) => {
                 $action
             },
@@ -645,7 +662,7 @@ impl<R> ServerLike for Server<R>
         self.router.ready(ServerRemote {
             sender: self.sender.clone(),
             connections: self.connections.clone(),
-        });
+        }, self.config.identity.public_key.clone());
     }
 
     fn set_interface_name(&mut self, interface_name: String) {

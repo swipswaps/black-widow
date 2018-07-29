@@ -455,7 +455,7 @@ impl ServerConfig {
             &Value::Table(ref table) => {
                 let mut threads = 2;
 
-                if let Some(&Value::Integer(ref num)) = table.get("name") {
+                if let Some(&Value::Integer(ref num)) = table.get("threads") {
                     let num = *num;
 
                     if num < 1 || num > 65535 {
@@ -613,7 +613,7 @@ impl Config {
                     }
                 }
 
-                if table.contains_key("interface") {
+                if table.contains_key("server") {
                     match ServerConfig::from_value(&table["server"]) {
                         Ok(serv) => {
                             server = serv;

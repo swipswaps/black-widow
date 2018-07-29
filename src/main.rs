@@ -1,4 +1,4 @@
-#![feature(proc_macro, specialization, proc_macro_path_invoc, extern_prelude, try_from)]
+#![feature(proc_macro, specialization, proc_macro_path_invoc, extern_prelude, try_from, use_extern_macros)]
 #![allow(warnings)]
 extern crate tun_tap;
 extern crate bytes;
@@ -16,6 +16,12 @@ extern crate toml;
 #[cfg(feature = "python-router")]
 extern crate pyo3;
 
+#[cfg(feature = "python-router")]
+extern crate nix;
+#[cfg(feature = "python-router")]
+use nix::sys::signal;
+
+
 extern crate tokio;
 extern crate tokio_core;
 extern crate futures;
@@ -25,7 +31,10 @@ extern crate multiqueue;
 #[macro_use]
 pub mod bw;
 
+
 use bw::prelude::*;
+#[cfg(feature = "python-router")]
+use bw::router::use_python;
 
 use tokio_core::reactor::Core;
 
@@ -47,6 +56,14 @@ use std::mem;
 use bytes::Bytes;
 
 use multiqueue::mpmc_queue;
+
+#[cfg(feature = "python-router")]
+extern fn handle_sigint(_:i32) {
+    // Acquire python lock and die, otherwise python will keep black-widow alive
+    use_python(|| {
+        exit(0)
+    })
+}
 
 fn cmd(cmd: &str, args: &[&str]) {
     let ecode = Command::new(cmd)
@@ -83,12 +100,27 @@ fn spawn_named<F, T>(name: &str, f: F) -> JoinHandle<T>
 }
 
 fn main() {
+    #[cfg(feature = "python-router")]
+    unsafe {
+        let sig_action = signal::SigAction::new(signal::SigHandler::Handler(handle_sigint),
+                                                signal::SaFlags::empty(),
+                                                signal::SigSet::empty());
+        signal::sigaction(signal::SIGINT, &sig_action);
+    }
+
     let config = get_config().unwrap();
 
     println!("Working with config: {:#?}", config);
 
     let core = Core::new().unwrap();
-    let iface = Iface::new(config.interface.name.as_str(), config.interface.mode).unwrap();
+    let iface = {
+        if config.interface.mode == Mode::Tun {
+            Iface::new(config.interface.name.as_str(), config.interface.mode).unwrap()
+        } else {
+            Iface::new_without_packet_information(config.interface.name.as_str(), config.interface.mode).unwrap()
+        }
+    };
+
     let name = iface.name().to_string();
 
     cmd("ip", &["link", "set", iface.name(), "mtu", format!("{}", config.interface.mtu).as_str()]);

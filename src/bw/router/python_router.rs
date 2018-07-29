@@ -43,7 +43,15 @@ impl PythonExec {
             let dict = PyDict::new(py);
             dict.set_item("err", x);
             println!("Failed running python code");
-            py.run("bw.log(err)", Some(self.globals.extract(py).unwrap()), Some(dict));
+            let write_error_code = r#"
+import time
+f = open('python_err.log', mode='a')
+f.write('Instance: ' + time.strftime("%c") + '\n')
+f.write(str(err) + '\n')
+f.close()
+"#;
+
+            py.run(write_error_code, Some(self.globals.extract(py).unwrap()), Some(dict));
         }
     }
 }
@@ -99,6 +107,12 @@ impl PythonEnvironment {
             globals
         }
     }
+}
+
+pub fn use_python<T, F: FnOnce() -> T>(with: F) ->T {
+    use_router(|_| {
+        with()
+    })
 }
 
 #[derive(Clone)]
@@ -189,6 +203,7 @@ def __run_handler(bw, handler, args):
         let globals: &PyDict = glob.extract(py).unwrap();
 
         for cb in cbs {
+            debug_println!("Running an handler!");
             dict.set_item("__handler", &cb);
             py.run(r#"__run_handler(__bw, __handler, (__type, __bytes, __ip, __port, __id))"#, Some(globals), Some(dict));
         }
@@ -215,7 +230,7 @@ def __run_handler(bw, handler, args):
         }
     }
 
-    fn ready(&mut self, remote: ServerRemote) {
+    fn ready(&mut self, remote: ServerRemote, own_id: Bytes) {
         println!("Running ready handlers");
         let gil = Python::acquire_gil();
         let py = gil.python();
@@ -225,15 +240,18 @@ def __run_handler(bw, handler, args):
             (r.bw_module.clone_ref(py), r.globals.clone_ref(py), r.on_boot_handlers.iter().map(|c| c.clone_ref(py)).collect(), r.interface_name.clone())
         });
 
+        let py_own_id = PyBytes::new(py, &own_id);
+
         let dict = PyDict::new(py);
         dict.set_item("__bw", &bw);
         dict.set_item("__interface_name", interface_name);
+        dict.set_item("__own_id", &py_own_id);
 
         let globals: &PyDict = glob.extract(py).unwrap();
 
         for cb in cbs {
             dict.set_item("__handler", &cb);
-            py.run(r#"__run_handler(__bw, __handler, (__interface_name,))"#, Some(globals), Some(dict));
+            py.run(r#"__run_handler(__bw, __handler, (__interface_name, __own_id))"#, Some(globals), Some(dict));
         }
     }
 
@@ -267,12 +285,12 @@ def __run_handler(bw, handler, args):
     }
 }
 
-# [py::modinit(bw)]
+# [pymodinit(bw)]
 fn init_module(py: Python, m: &PyModule) -> PyResult<()> {
     #[pyfn(m, "publish_message")]
     fn publish_message(message_type: u8, payload: Vec<u8>) -> PyResult<()> {
         debug_println!("Publishing message");
-        let message = Message::new(MessageType::from(message_type), Bytes::from(payload));
+        let message = Message::new(message_type, Bytes::from(payload));
 
         use_remote(|r| r.publish_message(message));
 
@@ -285,7 +303,7 @@ fn init_module(py: Python, m: &PyModule) -> PyResult<()> {
 
 
         let addr = SocketAddr::new(ip, port);
-        let message = Message::new(MessageType::from(message_type), Bytes::from(payload));
+        let message = Message::new(message_type, Bytes::from(payload));
 
         use_remote(|r| r.send_message_to_addr(message, addr));
 
@@ -294,7 +312,7 @@ fn init_module(py: Python, m: &PyModule) -> PyResult<()> {
 
     #[pyfn(m, "send_message_to_client")]
     fn send_message_to_client(message_type: u8, payload: Vec<u8>, public: Vec<u8>) -> PyResult<()> {
-        let message = Message::new(MessageType::from(message_type), Bytes::from(payload));
+        let message = Message::new(message_type, Bytes::from(payload));
         let id = Bytes::from(public);
 
         use_remote(|r| r.send_message_to_client(message, id));

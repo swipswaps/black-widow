@@ -11,7 +11,7 @@ mod python_router;
 pub trait Router<T>
     where T: Router<T> + Clone {
     fn start(&mut self) {}
-    fn ready(&mut self, remote: ServerRemote) {}
+    fn ready(&mut self, remote: ServerRemote, own_id: Bytes) {}
     fn set_interface_name(&mut self, interface_name: String) {}
     fn handle_message(&self, message: Message, addr: SocketAddr, id: Bytes) {}
     fn handle_packet(&self, packet: Bytes) {}
@@ -22,3 +22,5 @@ pub use self::dumb_router::DumbRouter;
 
 #[cfg(feature = "python-router")]
 pub use self::python_router::PythonRouter;
+#[cfg(feature = "python-router")]
+pub use self::python_router::use_python;

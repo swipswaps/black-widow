@@ -94,7 +94,7 @@ def add_boot_handler(handler):
     Add a new boot handler to the handler stack
 
     :param handler: The handler which should be called when the router is ready, given parameter is the interface name
-    :type handler: Callable[[str], Any]
+    :type handler: Callable[[str, bytes], Any]
     """
     pass
 
@@ -106,6 +106,7 @@ def log(message):
     :param message: The message you want to print
     :type message: str
     """
+    print(message)
 
 
 __ALL__ = [
