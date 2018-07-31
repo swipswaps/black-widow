@@ -1,8 +1,8 @@
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use bytes::{Bytes, ByteOrder, BufMut, BytesMut};
+use byteorder::{BigEndian, WriteBytesExt};
+use bytes::{Bytes, ByteOrder, BytesMut};
 
 use ring::rand::{SecureRandom, SystemRandom};
-use ring::signature::{VerificationAlgorithm, ED25519, Ed25519KeyPair};
+use ring::signature::{VerificationAlgorithm, ED25519};
 use ring::agreement::{X25519, agree_ephemeral, EphemeralPrivateKey};
 use ring::hkdf::extract_and_expand;
 use ring::hmac::{SigningKey, sign, verify_with_own_key};
@@ -15,10 +15,7 @@ use std::io::prelude::*;
 use std::io::Cursor;
 
 use crypto::chacha20::ChaCha20;
-use crypto::aes;
-use crypto::blockmodes::NoPadding;
 use crypto::symmetriccipher::SynchronousStreamCipher;
-use crypto::buffer::{ReadBuffer, WriteBuffer, BufferResult, RefReadBuffer, RefWriteBuffer};
 
 #[derive(Clone, Debug)]
 pub struct EncryptionParameters {
@@ -173,29 +170,6 @@ fn chacha20(key: &[u8], iv: &[u8], cipher_text: &[u8]) -> Bytes {
     return output.freeze();
 }
 
-#[inline]
-fn aes256cbc_enc(key: &[u8], iv: &[u8], cipher_text: &[u8]) -> Bytes {
-    let mut output = BytesMut::with_capacity(cipher_text.len());
-    unsafe {
-        output.set_len(cipher_text.len());
-    }
-
-    let mut encryptor = aes::cbc_encryptor(aes::KeySize::KeySize256, key, iv, NoPadding);
-
-    let mut read = RefReadBuffer::new(cipher_text);
-    let position = {
-        let mut write_buffer = RefWriteBuffer::new(&mut output);
-
-        encryptor.encrypt(&mut read, &mut write_buffer, true);
-        write_buffer.position()
-    };
-
-
-    output.truncate(position);
-
-    output.freeze()
-}
-
 #[derive(Debug)]
 pub struct EncryptedMessage {
     pub packet_id: u64,
@@ -218,7 +192,7 @@ impl EncryptedMessage {
 
     pub fn new_from_message(packet_id: u64, message: &Message, parameters: &EncryptionParameters) -> EncryptedMessage {
         let mut iv = [0; 12];
-        SystemRandom::new().fill(&mut iv);
+        SystemRandom::new().fill(&mut iv).unwrap();
 
         let mut message_clone = message.clone();
         message_clone.sign(parameters);
@@ -254,9 +228,9 @@ impl EncryptedMessage {
         }
 
         let mut cursor = Cursor::new(out);
-        cursor.write_u64::<BigEndian>(self.packet_id);
-        cursor.write(&self.iv);
-        cursor.write(&self.cipher_text);
+        cursor.write_u64::<BigEndian>(self.packet_id).unwrap();
+        cursor.write(&self.iv).unwrap();
+        cursor.write(&self.cipher_text).unwrap();
 
         Some(cursor.position() as usize)
     }
@@ -316,9 +290,9 @@ impl Message {
         }
 
         let mut cursor = Cursor::new(out);
-        cursor.write_u8({ if self.compressed { 128 } else { 0 } } + (self.message_type as u8 & 127));
-        cursor.write(&self.payload);
-        cursor.write(&self.hmac);
+        cursor.write_u8({ if self.compressed { 128 } else { 0 } } + (self.message_type as u8 & 127)).unwrap();
+        cursor.write(&self.payload).unwrap();
+        cursor.write(&self.hmac).unwrap();
 
         Some(cursor.position() as usize)
     }
@@ -393,18 +367,18 @@ impl KeyExchange {
 
         let mut cursor = Cursor::new(out);
 
-        cursor.write_u8(self.version);
-        cursor.write(&self.public_key);
-        cursor.write(&self.ephemeral_key);
-        cursor.write(&self.ephemeral_signature);
+        cursor.write_u8(self.version).unwrap();
+        cursor.write(&self.public_key).unwrap();
+        cursor.write(&self.ephemeral_key).unwrap();
+        cursor.write(&self.ephemeral_signature).unwrap();
         cursor.write_u8({
             if self.auth_type == KeyExchangeAuthType::SharedSecret {
                 1
             } else {
                 0
             }
-        });
-        cursor.write(&self.proof);
+        }).unwrap();
+        cursor.write(&self.proof).unwrap();
 
         Some(194)
     }
@@ -465,7 +439,7 @@ impl KeyExchange {
     pub fn new_key_exchange(config: &Config) -> Result<(KeyExchange, EphemeralPrivateKey), Unspecified> {
         let ephemeral_key = EphemeralPrivateKey::generate(&X25519, &SystemRandom::new())?;
         let mut ephemeral_public_key = vec![0; 32];
-        ephemeral_key.compute_public_key(&mut ephemeral_public_key);
+        ephemeral_key.compute_public_key(&mut ephemeral_public_key)?;
         let ephemeral_public_key = Bytes::from(ephemeral_public_key);
 
         Ok((
@@ -500,6 +474,8 @@ impl KeyExchange {
 
 #[cfg(test)]
 mod test {
+    use ring::signature::Ed25519KeyPair;
+
     use super::*;
 
     #[test]
@@ -555,7 +531,7 @@ mod test {
 
         if let Auth::Authority(ref mut auth) = config.auth {
             let mut authority = vec![0; 32];
-            SystemRandom::new().fill(&mut authority);
+            SystemRandom::new().fill(&mut authority).unwrap();
             let authority = Bytes::from(authority);
 
             let key_pair = Ed25519KeyPair::from_seed_unchecked(Input::from(&authority));
@@ -588,16 +564,16 @@ mod test {
     #[test]
     fn test_message() {
         let mut all = vec![0; 64];
-        SystemRandom::new().fill(&mut all);
+        SystemRandom::new().fill(&mut all).unwrap();
 
         let parameters = EncryptionParameters::from_bytes(Bytes::from(all));
 
         assert!(parameters.is_some());
         let parameters = parameters.unwrap();
 
-        let mut message = Message {
+        let message = Message {
             compressed: false,
-            message_type: MessageType::Ethernet,
+            message_type: 0,
             payload: Bytes::from(b"Hello world!".to_vec()),
             hmac: Bytes::new(),
         };

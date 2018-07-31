@@ -67,6 +67,5 @@ pub mod prelude {
     pub use super::config::*;
     pub use super::packet::*;
     pub use super::router::*;
-    #[macro_use]
     pub use super::macros;
 }

@@ -1,29 +1,20 @@
 use std::net::SocketAddr;
-use std::io::Error;
 use std::mem;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::u64;
-use std::sync::{Mutex, MutexGuard, Arc};
+use std::sync::{Mutex, Arc};
 use std::sync::mpsc::{channel, Sender};
 use std::time::Instant;
 use std::collections::HashMap;
 use std::collections::hash_map::Values;
 
-use tokio::prelude::*;
-use futures::stream::{Stream, SplitStream, SplitSink};
-use bytes::{Bytes, BytesMut, ByteOrder};
+use bytes::{Bytes, ByteOrder};
 use byteorder::BigEndian;
-use ring::agreement::{EphemeralPrivateKey, X25519, PUBLIC_KEY_MAX_LEN, agree_ephemeral};
+use ring::agreement::EphemeralPrivateKey;
 use ring::rand::{SecureRandom, SystemRandom};
-use ring;
-use untrusted;
-use multiqueue::MPMCSender;
 
 use super::prelude::*;
-
-#[macro_use]
-use super::macros;
 
 #[derive(Debug, Clone)]
 pub enum ServerEvent {
@@ -96,7 +87,7 @@ impl ConnectionInfo {
     pub fn next_packet_id(&mut self) -> u64 {
         if self.packet_id == 0 {
             let mut x = vec![0u8; 8];
-            SystemRandom::new().fill(&mut x);
+            SystemRandom::new().fill(&mut x).unwrap();
 
             self.packet_id = BigEndian::read_u64(&x);
         }
@@ -386,7 +377,7 @@ impl ServerRemote {
     }
 
     pub fn write_packet(&self, data: Bytes) {
-        self.sender.send(ServerEvent::Tunnel(data));
+        self.sender.send(ServerEvent::Tunnel(data)).unwrap();
     }
 
     pub fn send_message(&self, message: &Message, info: MutexConnectionInfo) {
@@ -396,7 +387,7 @@ impl ServerRemote {
             let encrypted_message = EncryptedMessage::new_from_message(next_id, &message, &parameters);
 
             if let Some(bytes) = Packet::EncryptedMessage(encrypted_message).get_bytes() {
-                self.sender.send(ServerEvent::Packet(bytes, addr));
+                self.sender.send(ServerEvent::Packet(bytes, addr)).unwrap();
             }
         }
     }
@@ -455,9 +446,10 @@ impl<R> Server<R>
     }
 
     fn queue_event(&self, event: ServerEvent) {
-        self.sender.send(event);
+        self.sender.send(event).unwrap();
     }
 
+    #[allow(dead_code)]
     fn get_connections(&self) -> Vec<MutexConnectionInfo> {
         use_item!(self.connections, mut connections => connections.get_cloned())
     }
@@ -466,7 +458,7 @@ impl<R> Server<R>
         self.router.handle_packet(data);
     }
 
-    fn on_dht_krpc(&self, data: Bytes, addr: SocketAddr) {
+    fn on_dht_krpc(&self, _data: Bytes, _addr: SocketAddr) {
         // TODO
     }
 
@@ -533,7 +525,7 @@ impl<R> Server<R>
                     }
                 }
 
-                ConnectionState::Stream(x) => {
+                ConnectionState::Stream(_) => {
                     if let Ok((exchange, key)) = KeyExchange::new_key_exchange(&self.config) {
                         if let Some(bytes) = Packet::KeyExchange(exchange).get_bytes() {
                             info.connection_state = ConnectionState::KeyExchange(key);

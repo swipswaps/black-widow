@@ -1,14 +1,8 @@
 use super::super::prelude::*;
 
-use std::net::{SocketAddr, IpAddr};
+use std::net::SocketAddr;
 use std::sync::{Mutex, Arc};
-use std::marker::PhantomData;
-use std::sync::mpsc::{Receiver, channel, Sender};
-use multiqueue::{MPMCSender, mpmc_queue};
 use std::thread;
-use std::mem;
-use std::convert::TryFrom;
-use std::time::{Instant, Duration};
 use std::fs::File;
 use std::io::BufReader;
 use std::io::prelude::*;
@@ -41,7 +35,7 @@ impl PythonExec {
 
         if let Err(x) = py.run(code, Some(self.globals.extract(py).unwrap()), None) {
             let dict = PyDict::new(py);
-            dict.set_item("err", x);
+            dict.set_item("err", x).unwrap();
             println!("Failed running python code");
             let write_error_code = r#"
 import time
@@ -51,7 +45,7 @@ f.write(str(err) + '\n')
 f.close()
 "#;
 
-            py.run(write_error_code, Some(self.globals.extract(py).unwrap()), Some(dict));
+            py.run(write_error_code, Some(self.globals.extract(py).unwrap()), Some(dict)).unwrap();
         }
     }
 }
@@ -66,9 +60,9 @@ impl PythonEnvironment {
         let object = py.eval("globals()", None, None).unwrap().to_object(py);
         let globals: &PyDict = object.extract(py).unwrap();
 
-        globals.set_item("bw", m);
+        globals.set_item("bw", m).unwrap();
 
-        init_module(py, m);
+        init_module(py, m).unwrap();
 
         PythonEnvironment {
             remote: None,
@@ -83,11 +77,12 @@ impl PythonEnvironment {
         }
     }
 
+    #[allow(dead_code)]
     fn run(&mut self, script: &str) -> PyResult<()> {
         let gil = Python::acquire_gil();
         let py = gil.python();
 
-        py.run(script, None, Some(self.globals.extract(py).unwrap()));
+        py.run(script, None, Some(self.globals.extract(py).unwrap())).unwrap();
 
         Ok(())
     }
@@ -155,11 +150,9 @@ fn use_remote<T, F: FnOnce(&ServerRemote) -> T>(f: F) -> Option<T> {
 }
 
 fn run_python_in_router(code: &str) -> () {
-    let mut exc = use_router(|r| -> PythonExec {
+    use_router(|r| -> PythonExec {
         r.get_exec()
-    });
-
-    exc.run(code)
+    }).run(code)
 }
 
 impl Router<PythonRouter> for PythonRouter {
@@ -193,19 +186,18 @@ def __run_handler(bw, handler, args):
         let id = PyBytes::new(py, &id);
 
         let dict = PyDict::new(py);
-        dict.set_item("__bw", &bw);
-        dict.set_item("__type", message.message_type as u8);
-        dict.set_item("__bytes", &bytes);
-        dict.set_item("__ip", format!("{}", addr.ip()));
-        dict.set_item("__port", addr.port());
-        dict.set_item("__id", &id);
+        dict.set_item("__bw", &bw).unwrap();
+        dict.set_item("__type", message.message_type as u8).unwrap();
+        dict.set_item("__bytes", &bytes).unwrap();
+        dict.set_item("__ip", format!("{}", addr.ip())).unwrap();
+        dict.set_item("__port", addr.port()).unwrap();
+        dict.set_item("__id", &id).unwrap();
 
         let globals: &PyDict = glob.extract(py).unwrap();
 
         for cb in cbs {
-            debug_println!("Running an handler!");
-            dict.set_item("__handler", &cb);
-            py.run(r#"__run_handler(__bw, __handler, (__type, __bytes, __ip, __port, __id))"#, Some(globals), Some(dict));
+            dict.set_item("__handler", &cb).unwrap();
+            py.run(r#"__run_handler(__bw, __handler, (__type, __bytes, __ip, __port, __id))"#, Some(globals), Some(dict)).unwrap();
         }
     }
 
@@ -219,14 +211,14 @@ def __run_handler(bw, handler, args):
         let bytes = PyBytes::new(py, &packet);
 
         let dict = PyDict::new(py);
-        dict.set_item("__bw", &bw);
-        dict.set_item("__bytes", &bytes);
+        dict.set_item("__bw", &bw).unwrap();
+        dict.set_item("__bytes", &bytes).unwrap();
 
         let globals: &PyDict = glob.extract(py).unwrap();
 
         for cb in cbs {
-            dict.set_item("__handler", &cb);
-            py.run(r#"__run_handler(__bw, __handler, (__bytes,))"#, Some(globals), Some(dict));
+            dict.set_item("__handler", &cb).unwrap();
+            py.run(r#"__run_handler(__bw, __handler, (__bytes,))"#, Some(globals), Some(dict)).unwrap();
         }
     }
 
@@ -243,15 +235,15 @@ def __run_handler(bw, handler, args):
         let py_own_id = PyBytes::new(py, &own_id);
 
         let dict = PyDict::new(py);
-        dict.set_item("__bw", &bw);
-        dict.set_item("__interface_name", interface_name);
-        dict.set_item("__own_id", &py_own_id);
+        dict.set_item("__bw", &bw).unwrap();
+        dict.set_item("__interface_name", interface_name).unwrap();
+        dict.set_item("__own_id", &py_own_id).unwrap();
 
         let globals: &PyDict = glob.extract(py).unwrap();
 
         for cb in cbs {
-            dict.set_item("__handler", &cb);
-            py.run(r#"__run_handler(__bw, __handler, (__interface_name, __own_id))"#, Some(globals), Some(dict));
+            dict.set_item("__handler", &cb).unwrap();
+            py.run(r#"__run_handler(__bw, __handler, (__interface_name, __own_id))"#, Some(globals), Some(dict)).unwrap();
         }
     }
 
@@ -265,16 +257,16 @@ def __run_handler(bw, handler, args):
         let id = PyBytes::new(py, &id);
 
         let dict = PyDict::new(py);
-        dict.set_item("__bw", &bw);
-        dict.set_item("__ip", format!("{}", addr.ip()));
-        dict.set_item("__port", addr.port());
-        dict.set_item("__id", &id);
+        dict.set_item("__bw", &bw).unwrap();
+        dict.set_item("__ip", format!("{}", addr.ip())).unwrap();
+        dict.set_item("__port", addr.port()).unwrap();
+        dict.set_item("__id", &id).unwrap();
 
         let globals: &PyDict = glob.extract(py).unwrap();
 
         for cb in cbs {
-            dict.set_item("__handler", &cb);
-            py.run(r#"__run_handler(__bw, __handler, (__ip, __port, __id))"#, Some(globals), Some(dict));
+            dict.set_item("__handler", &cb).unwrap();
+            py.run(r#"__run_handler(__bw, __handler, (__ip, __port, __id))"#, Some(globals), Some(dict)).unwrap();
         }
     }
 
@@ -286,7 +278,7 @@ def __run_handler(bw, handler, args):
 }
 
 # [pymodinit(bw)]
-fn init_module(py: Python, m: &PyModule) -> PyResult<()> {
+fn init_module(_py: Python, m: &PyModule) -> PyResult<()> {
     #[pyfn(m, "publish_message")]
     fn publish_message(message_type: u8, payload: Vec<u8>) -> PyResult<()> {
         debug_println!("Publishing message");

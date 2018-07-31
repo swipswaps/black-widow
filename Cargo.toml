@@ -3,28 +3,24 @@ authors = ["eater <hello@eaterofco.de>"]
 name = "black-widow"
 version = "0.1.0"
 
+[[bin]]
+name = "bw"
+path = "src/main.rs"
+
 [dependencies]
-byteorder = "1.2.2"
-bytes = "0.4.6"
-cpuprofiler = "0.0.3"
-docopt = "0.8.3"
-futures = "0.1.20"
+byteorder = "1.2.4"
+bytes = "0.4.9"
+docopt = "1.0.0"
+futures = "0.1.23"
 multiqueue = "0.3.2"
-ring = "0.12.1"
+ring = "0.13.2"
 rust-crypto = "0.2.36"
-rustc-serialize = "0.3.24"
-serde = "1.0.36"
-serde_derive = "1.0.36"
-tokio = "0.1.4"
-tokio-core = "0.1.16"
-tokio-io = "0.1.6"
-tokio-udp = "0.1.0"
 toml = "0.4.6"
-untrusted = "0.5.1"
+untrusted = "0.6.2"
 
 [dependencies.tun-tap]
-git = "https://github.com/the-eater/tuntap"
-branch = "feature/allow_no_packet_info"
+git = "https://github.com/vorner/tuntap"
+default-features = false
 
 [dependencies.nix]
 version = "0.11.0"
@@ -33,11 +29,11 @@ optional = true
 [dependencies.pyo3]
 features = ["python3"]
 optional = true
-version = "0.3"
+version = "0.4.0"
 
 [dependencies.uuid]
 features = ["v4"]
-version = "0.6.2"
+version = "0.6.5"
 
 [features]
 python-router = ["pyo3", "nix"]

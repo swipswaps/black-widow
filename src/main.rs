@@ -1,16 +1,14 @@
-#![feature(proc_macro, specialization, proc_macro_path_invoc, extern_prelude, try_from, use_extern_macros)]
-#![allow(warnings)]
+#![cfg_attr(feature = "python-router", feature(use_extern_macros))]
+
 extern crate tun_tap;
 extern crate bytes;
 extern crate byteorder;
 extern crate ring;
 extern crate untrusted;
-extern crate serde;
 extern crate uuid;
 extern crate crypto;
-#[macro_use]
-extern crate serde_derive;
-#[macro_use]
+
+#[cfg_attr(test, macro_use)]
 extern crate toml;
 
 #[cfg(feature = "python-router")]
@@ -18,12 +16,11 @@ extern crate pyo3;
 
 #[cfg(feature = "python-router")]
 extern crate nix;
+
 #[cfg(feature = "python-router")]
 use nix::sys::signal;
 
 
-extern crate tokio;
-extern crate tokio_core;
 extern crate futures;
 
 extern crate multiqueue;
@@ -36,29 +33,26 @@ use bw::prelude::*;
 #[cfg(feature = "python-router")]
 use bw::router::use_python;
 
-use tokio_core::reactor::Core;
-
 use tun_tap::{Iface, Mode};
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::fs::File;
-use std::time::{Duration, SystemTime, UNIX_EPOCH, Instant};
+use std::time::Duration;
 use std::thread::{Builder, sleep, JoinHandle};
 use std::sync::Arc;
 use std::sync::mpsc::channel;
 use std::io::prelude::*;
-use std::io::{Stdin, Stdout, stdin, stdout};
+use std::io::stdin;
+#[cfg(feature = "python-router")]
 use std::process::exit;
 use std::process::Command;
-use std::borrow::Cow;
-use std::mem;
 
 use bytes::Bytes;
 
 use multiqueue::mpmc_queue;
 
 #[cfg(feature = "python-router")]
-extern fn handle_sigint(_:i32) {
+extern fn handle_sigint(_: i32) {
     // Acquire python lock and die, otherwise python will keep black-widow alive
     use_python(|| {
         exit(0)
@@ -79,7 +73,7 @@ fn get_config() -> Result<Config, Vec<String>> {
     let mut config = File::open("config/example_secret.toml").unwrap();
     let mut contents = String::new();
 
-    config.read_to_string(&mut contents);
+    config.read_to_string(&mut contents).unwrap();
 
     if let Ok(value) = contents.parse::<toml::Value>() {
         return Config::from_value(&value);
@@ -101,23 +95,23 @@ fn spawn_named<F, T>(name: &str, f: F) -> JoinHandle<T>
 
 fn main() {
     #[cfg(feature = "python-router")]
-    unsafe {
+        unsafe {
         let sig_action = signal::SigAction::new(signal::SigHandler::Handler(handle_sigint),
                                                 signal::SaFlags::empty(),
                                                 signal::SigSet::empty());
-        signal::sigaction(signal::SIGINT, &sig_action);
+        signal::sigaction(signal::SIGINT, &sig_action).unwrap();
     }
 
     let config = get_config().unwrap();
 
     println!("Working with config: {:#?}", config);
 
-    let core = Core::new().unwrap();
+
     let iface = {
         if config.interface.mode == Mode::Tun {
             Iface::new(config.interface.name.as_str(), config.interface.mode).unwrap()
         } else {
-            Iface::new_without_packet_information(config.interface.name.as_str(), config.interface.mode).unwrap()
+            Iface::without_packet_info(config.interface.name.as_str(), config.interface.mode).unwrap()
         }
     };
 
@@ -125,11 +119,10 @@ fn main() {
 
     cmd("ip", &["link", "set", iface.name(), "mtu", format!("{}", config.interface.mtu).as_str()]);
 
-    let mut socket = UdpSocket::bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0)).unwrap();
+    let socket = UdpSocket::bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0)).unwrap();
     println!("Listening on {:?}", socket.local_addr().unwrap());
 
 
-    let runtime = core.remote();
     let (all_sender, all_receiver) = channel();
     let (server_sender, server_receiver) = mpmc_queue::<ServerEvent>(1000);
 
@@ -154,7 +147,7 @@ fn main() {
 
         loop {
             if let Ok(size) = iface_reader.recv(&mut x) {
-                server_writer.try_send(ServerEvent::Tunnel(Bytes::from(&x[..size])));
+                server_writer.try_send(ServerEvent::Tunnel(Bytes::from(&x[..size]))).unwrap();
             }
         }
     });
@@ -169,7 +162,7 @@ fn main() {
 
         loop {
             if let Ok((size, from)) = udp_reader.recv_from(&mut x) {
-                server_writer.try_send(ServerEvent::Packet(Bytes::from(&x[..size]), from));
+                server_writer.try_send(ServerEvent::Packet(Bytes::from(&x[..size]), from)).unwrap();
             }
         }
     });
@@ -179,25 +172,22 @@ fn main() {
         let mut input = String::new();
         loop {
             if let Ok(size) = stdin().read_line(&mut input) {
-                server_writer.try_send(ServerEvent::Control(input[..size].to_string()));
+                server_writer.try_send(ServerEvent::Control(input[..size].to_string())).unwrap();
                 input = String::new();
             }
         }
     });
 
     let all_reader = spawn_named("server event listener", move || {
-        let mut amount = 0;
-        let mut amount_now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-
         loop {
             if let Ok(event) = all_receiver.recv() {
                 match event {
                     ServerEvent::Packet(data, addr) => {
-                        udp_writer.send_to(data.as_ref(), addr);
+                        udp_writer.send_to(data.as_ref(), addr).unwrap();
                     }
 
                     ServerEvent::Tunnel(data) => {
-                        iface_writer.send(data.as_ref());
+                        iface_writer.send(data.as_ref()).unwrap();
                     }
 
                     ServerEvent::Control(data) => {
@@ -208,9 +198,6 @@ fn main() {
         }
     });
 
-    let mut count: [Vec<u64>; 3] = [vec![], vec![], vec![]];
-    let mut last = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-
     let mut threads = vec![];
 
 
@@ -219,7 +206,7 @@ fn main() {
     for i in 0..thread_cnt {
         let serv_recv = server_receiver.clone();
         let server_clone = server.clone();
-        threads.push(spawn_named(&format!("server digestion {}", 1), move || {
+        threads.push(spawn_named(&format!("server digestion {}", i), move || {
             loop {
                 if let Ok(event) = serv_recv.recv() {
                     server_clone.send_event(event);

@@ -1,14 +1,11 @@
 use std::fs::File;
 use std::io::prelude::*;
-use std::io;
-use std::ascii::AsciiExt;
 
 use std::fmt::{Debug, Formatter};
 use std::fmt;
 
 use bytes::Bytes;
-use toml::value::{Value, Table};
-use uuid::Uuid;
+use toml::value::Value;
 
 use untrusted::Input;
 
@@ -16,7 +13,7 @@ use tun_tap::Mode;
 
 use ring::digest;
 use ring::hmac::SigningKey;
-use ring::signature::{Ed25519KeyPair, ED25519};
+use ring::signature::Ed25519KeyPair;
 
 
 fn read_file(file_path: &str, path: &str) -> Result<Bytes, Vec<String>> {
@@ -572,7 +569,12 @@ impl Config {
                 let mut auth: Option<Auth> = None;
                 let mut identity: Option<Identity> = None;
                 let mut network: Option<Network> = None;
-                let mut router: Option<RouterConfig> = None;
+                let mut router: RouterConfig = RouterConfig {
+                    name: ChosenRouter::Dumb,
+                    #[cfg(feature = "python-router")]
+                    python: None,
+                };
+
                 let mut interface = Interface {
                     mtu: 1400,
                     mode: Mode::Tun,
@@ -660,20 +662,17 @@ impl Config {
 
                 if let Some(ref value) = table.get("router") {
                     match RouterConfig::from_value(value) {
-                        Ok(rou) => router = Some(rou),
+                        Ok(rou) => router = rou,
                         Err(err) => {
                             error_vec.extend(err);
                             has_errors = true;
                         }
                     }
-                } else {
-                    has_errors = true;
-                    error_vec.push(String::from("Config is missing 'router' key"));
                 }
 
                 if !has_errors {
                     return Ok(Config {
-                        router: router.unwrap(),
+                        router,
                         interface,
                         server,
                         auth: auth.unwrap(),

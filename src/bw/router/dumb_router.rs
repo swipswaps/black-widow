@@ -1,14 +1,11 @@
 use super::Router;
-use super::Server;
 use super::super::prelude::*;
 
 
 use bytes::Bytes;
-use std::mem;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{Mutex, Arc};
-use multiqueue::MPMCSender as Sender;
 
 
 #[derive(Clone)]
@@ -46,7 +43,7 @@ impl Router<DumbRouter> for DumbRouter {
         &self.own_id.copy_from_slice(&own_id[..32]);
     }
 
-    fn handle_message(&self, message: Message, addr: SocketAddr, id: Bytes) {
+    fn handle_message(&self, message: Message, _addr: SocketAddr, id: Bytes) {
         let cloned_payload = message.payload.clone();
         let dest = &cloned_payload[0..6];
         let source = &cloned_payload[6..12];
