@@ -7,6 +7,14 @@ extern crate ring;
 extern crate untrusted;
 extern crate uuid;
 extern crate crypto;
+extern crate futures;
+extern crate multiqueue;
+
+extern crate serde;
+#[macro_use]
+extern crate serde_derive;
+extern crate docopt;
+
 
 #[cfg_attr(test, macro_use)]
 extern crate toml;
@@ -20,14 +28,9 @@ extern crate nix;
 #[cfg(feature = "python-router")]
 use nix::sys::signal;
 
-
-extern crate futures;
-
-extern crate multiqueue;
-
 #[macro_use]
 pub mod bw;
-
+use docopt::Docopt;
 
 use bw::prelude::*;
 #[cfg(feature = "python-router")]
@@ -51,62 +54,59 @@ use bytes::Bytes;
 
 use multiqueue::mpmc_queue;
 
-#[cfg(feature = "python-router")]
-extern fn handle_sigint(_: i32) {
-    // Acquire python lock and die, otherwise python will keep black-widow alive
-    use_python(|| {
-        exit(0)
-    })
-}
+const USAGE: &'static str = "
+bw - Black Widow
 
-fn cmd(cmd: &str, args: &[&str]) {
-    let ecode = Command::new(cmd)
-        .args(args)
-        .spawn()
-        .unwrap()
-        .wait()
-        .unwrap();
-    assert!(ecode.success(), "Failed to execte {}", cmd);
-}
+Usage:
+    bw daemon [--config <config>]
+    bw display-config [--config <config>]
+    bw [options]
 
-fn get_config() -> Result<Config, Vec<String>> {
-    let mut config = File::open("config/example_secret.toml").unwrap();
-    let mut contents = String::new();
+Options:
+    -h, --help  Display this help
+";
 
-    config.read_to_string(&mut contents).unwrap();
-
-    if let Ok(value) = contents.parse::<toml::Value>() {
-        return Config::from_value(&value);
-    } else {
-        return Err(vec![String::from("Failed to load config")]);
-    }
-}
-
-fn spawn_named<F, T>(name: &str, f: F) -> JoinHandle<T>
-    where
-        F: FnOnce() -> T,
-        F: Send + 'static,
-        T: Send + 'static {
-    Builder::new()
-        .name(name.to_string())
-        .spawn(f)
-        .unwrap()
+#[derive(Deserialize)]
+struct Args {
+    arg_config: Option<String>,
+    cmd_daemon: bool,
+    cmd_display_config: bool,
 }
 
 fn main() {
-    #[cfg(feature = "python-router")]
-        unsafe {
+
+    let args: Args = Docopt::new(USAGE)
+        .and_then(|d| d.argv(std::env::args().into_iter()).deserialize())
+        .unwrap_or_else(|e| e.exit());
+
+
+    #[cfg(feature = "python-router")] unsafe {
         let sig_action = signal::SigAction::new(signal::SigHandler::Handler(handle_sigint),
                                                 signal::SaFlags::empty(),
                                                 signal::SigSet::empty());
         signal::sigaction(signal::SIGINT, &sig_action).unwrap();
     }
 
-    let config = get_config().unwrap();
+    if args.cmd_daemon {
+        let config = get_config(&args.arg_config.clone().unwrap_or("config/example_secret.toml".to_string())).unwrap();
+        run_daemon(config);
 
-    println!("Working with config: {:#?}", config);
+        return;
+    }
+
+    if args.cmd_display_config {
+        let config = get_config(&args.arg_config.clone().unwrap_or("config/example_secret.toml".to_string())).unwrap();
+        println!("{:#?}", config);
+
+        return;
+    }
+
+    println!("No command given. see --help for more info");
+}
 
 
+
+fn run_daemon(config: Config) {
     let iface = {
         if config.interface.mode == Mode::Tun {
             Iface::new(config.interface.name.as_str(), config.interface.mode).unwrap()
@@ -227,4 +227,46 @@ fn main() {
     udp_reader.join().unwrap();
     stdin_reader.join().unwrap();
     all_reader.join().unwrap();
+}
+
+#[cfg(feature = "python-router")]
+extern fn handle_sigint(_: i32) {
+    // Acquire python lock and die, otherwise python will keep black-widow alive
+    use_python(|| {
+        exit(0)
+    })
+}
+
+fn cmd(cmd: &str, args: &[&str]) {
+    let ecode = Command::new(cmd)
+        .args(args)
+        .spawn()
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert!(ecode.success(), "Failed to execte {}", cmd);
+}
+
+fn get_config(path: &str) -> Result<Config, Vec<String>> {
+    let mut config = File::open(path).unwrap();
+    let mut contents = String::new();
+
+    config.read_to_string(&mut contents).unwrap();
+
+    if let Ok(value) = contents.parse::<toml::Value>() {
+        return Config::from_value(&value);
+    } else {
+        return Err(vec![String::from("Failed to load config")]);
+    }
+}
+
+fn spawn_named<F, T>(name: &str, f: F) -> JoinHandle<T>
+    where
+        F: FnOnce() -> T,
+        F: Send + 'static,
+        T: Send + 'static {
+    Builder::new()
+        .name(name.to_string())
+        .spawn(f)
+        .unwrap()
 }
