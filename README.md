@@ -2,7 +2,7 @@
 
 A Meshnet VPN on Layer 2.
 
-🔥**Warning** 🔥 This VPN or it's protocol has not received any formal or informal audit, use at your own risk. 
+🔥 **Warning** 🔥 This VPN or it's protocol has not received any formal or informal audit, use at your own risk. 
 
 # What is it?
 
@@ -29,7 +29,7 @@ The downsides of this are that there is no relaying, and if 1 node is not connec
 
 ## Python router
 
-**Notice:** For this router to be included you must build black-widow with the feature `python-router`
+**Notice:** For this router to be included you must build black-widow with the feature `python-router`, since the `pyo3` runtime requires certain rustc feature flags to be turned on, it will only build on the nightly branch of rust.
 
 The python router starts a python runtime which may hook in to the black-widow router functions, allowing you to prototype a router in python before typing it in rust
 An example can be seen [here](python/example_router.py)
