@@ -9,7 +9,7 @@ use ring::hmac::{SigningKey, sign, verify_with_own_key};
 use ring::digest::{SHA512, SHA1};
 use ring::error::Unspecified;
 use untrusted::Input;
-use super::config::{Config, Auth};
+use super::prelude::*;
 
 use std::io::prelude::*;
 use std::io::Cursor;
@@ -391,20 +391,20 @@ impl KeyExchange {
         verify_ed25519!(&self.public_key, &self.ephemeral_key, &self.ephemeral_signature);
 
         match &config.auth {
-            &Auth::Authority(ref authority) => {
+            &AuthConfig::CertificateAuthorityConfig(ref authority) => {
                 if self.auth_type != KeyExchangeAuthType::Authority {
                     return false;
                 }
 
-                verify_ed25519!(&authority.key, &self.public_key, &self.proof);
+                verify_ed25519!(&authority.ca.get_value().unwrap(), &self.public_key, &self.proof);
             }
 
-            &Auth::SharedSecret(ref secret) => {
+            &AuthConfig::SharedSecretConfig(ref secret) => {
                 if self.auth_type != KeyExchangeAuthType::SharedSecret {
                     return false;
                 }
 
-                if let Err(_) = verify_with_own_key(&secret.get_signing_key(), &self.ephemeral_key, &self.proof) {
+                if let Err(_) = verify_with_own_key(&SigningKey::new(&SHA512, &secret.secret), &self.ephemeral_key, &self.proof) {
                     return false;
                 }
             }
@@ -422,7 +422,7 @@ impl KeyExchange {
             Input::from(&self.ephemeral_key),
             Unspecified,
             |key_material| {
-                extract_and_expand(&SigningKey::new(&SHA512, &[0; 64]), key_material, &config.network.id, &mut out);
+                extract_and_expand(&SigningKey::new(&SHA512, &[0; 64]), key_material, &config.network_id, &mut out);
 
                 Ok(())
             },
@@ -445,11 +445,11 @@ impl KeyExchange {
         Ok((
             KeyExchange {
                 version: 1,
-                public_key: config.identity.public_key.clone(),
+                public_key: config.get_public_key(),
                 ephemeral_key: ephemeral_public_key.clone(),
-                ephemeral_signature: config.identity.sign(&ephemeral_public_key),
+                ephemeral_signature: Bytes::from(config.get_key_pair().sign(&ephemeral_public_key).as_ref()),
                 auth_type: {
-                    if config.auth.is_shared_secret() {
+                    if let AuthConfig::SharedSecretConfig(_) = config.auth {
                         KeyExchangeAuthType::SharedSecret
                     } else {
                         KeyExchangeAuthType::Authority
@@ -457,12 +457,12 @@ impl KeyExchange {
                 },
                 proof: {
                     match &config.auth {
-                        &Auth::SharedSecret(ref secret) => {
-                            Bytes::from(sign(&secret.get_signing_key(), &ephemeral_public_key).as_ref())
+                        &AuthConfig::SharedSecretConfig(ref secret) => {
+                            Bytes::from(sign(&SigningKey::new(&SHA512, &secret.secret), &ephemeral_public_key).as_ref())
                         }
 
-                        &Auth::Authority(ref auth) => {
-                            auth.signature.clone()
+                        &AuthConfig::CertificateAuthorityConfig(ref auth) => {
+                            auth.signature.get_value().unwrap()
                         }
                     }
                 },

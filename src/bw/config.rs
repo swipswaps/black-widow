@@ -1,692 +1,300 @@
-use std::fs::File;
-use std::io::prelude::*;
-
-use std::fmt::{Debug, Formatter};
-use std::fmt;
-
 use bytes::Bytes;
-use toml::value::Value;
 
-use untrusted::Input;
+use ring::signature::Ed25519KeyPair;
 
 use tun_tap::Mode;
 
-use ring::digest;
-use ring::hmac::SigningKey;
-use ring::signature::Ed25519KeyPair;
+use untrusted::Input;
+
+use std::net::SocketAddr;
+use std::io::{Error, Read};
+use std::fs::File;
 
 
-fn read_file(file_path: &str, path: &str) -> Result<Bytes, Vec<String>> {
-    let mut error_vec = vec![];
 
-    let file = File::open(file_path);
-
-    if file.is_err() {
-        error_vec.push(String::from(format!("Couldn't open file '{}' for {}", file_path, path)));
-
-        return Err(error_vec);
-    }
-
-    let mut file = file.unwrap();
-    let mut data: Vec<u8> = vec![0; 1024];
-    let size = file.read(&mut data);
-
-    if size.is_err() {
-        error_vec.push(String::from(format!("Couldn't open file '{}' for {}", file_path, path)));
-
-        return Err(error_vec);
-    }
-
-    let size = size.unwrap();
-
-    Ok(Bytes::from(&data[..size]))
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum FileOrValue {
+    File {
+        file: String,
+        #[serde(default)]
+        #[serde(skip)]
+        cache: Option<Bytes>,
+    },
+    Value {
+        value: Vec<u8>,
+    },
 }
 
-fn parse_file_or_value(value: &Value, path: &str, default_is_path: bool) -> Result<Bytes, Vec<String>> {
-    let mut error_vec = vec![];
+impl FileOrValue {
+    pub fn load(&mut self) -> Result<(), Error> {
+        let val = self.get_value()?;
 
-    match value {
-        &Value::String(ref string) => {
-            if default_is_path {
-                return read_file(&string, path);
-            } else {
-                return Ok(Bytes::from(string.as_bytes()));
-            }
-        }
-
-        &Value::Table(ref table) => {
-            if let Some(&Value::String(ref value)) = table.get("value") {
-                return Ok(Bytes::from(value.as_bytes()));
-            }
-
-            if let Some(&Value::String(ref file)) = table.get("file") {
-                return read_file(&file, path);
-            }
-
-            error_vec.push(String::from(format!("Need a string with the key 'value' or 'file' in {}", path)));
-        }
-
-        _ => {
-            error_vec.push(String::from(format!("Need a string or table with the key 'value' or 'file' for {}", path)));
-        }
-    }
-
-    Err(error_vec)
-}
-
-#[derive(Debug, Clone)]
-pub enum Auth {
-    SharedSecret(SharedSecret),
-    Authority(Authority),
-}
-
-impl Auth {
-    pub fn from_value(value: &Value) -> Result<Auth, Vec<String>> {
-        let mut error_vec: Vec<String> = vec![];
-
-        match value {
-            &Value::String(ref string) => {
-                return Ok(Auth::SharedSecret(SharedSecret::new(Bytes::from(string.as_bytes()))));
-            }
-
-            &Value::Table(ref table) => {
-                if let Some(secret) = table.get("secret") {
-                    match parse_file_or_value(secret, "auth.secret", false) {
-                        Err(err) => {
-                            return Err(err);
-                        }
-
-                        Ok(bytes) => {
-                            return Ok(Auth::SharedSecret(SharedSecret::new(bytes)));
-                        }
-                    }
-                }
-
-                if table.contains_key("key") && table.contains_key("signature") {
-                    let key_result = parse_file_or_value(&table["key"], "auth.key", true);
-                    let signature_result = parse_file_or_value(&table["signature"], "auth.signature", true);
-
-                    if let &Err(ref errors) = &key_result {
-                        error_vec.extend({
-                            let mut new_errors = vec![];
-                            for error in errors {
-                                new_errors.push(String::from(error.as_str()));
-                            }
-
-                            new_errors
-                        });
-                    }
-
-                    if let &Err(ref errors) = &signature_result {
-                        error_vec.extend({
-                            let mut new_errors = vec![];
-                            for error in errors {
-                                new_errors.push(String::from(error.as_str()));
-                            }
-
-                            new_errors
-                        });
-                    }
-
-                    if let (Ok(key), Ok(signature)) = (key_result, signature_result) {
-                        return Ok(Auth::Authority(Authority {
-                            key,
-                            signature,
-                        }));
-                    }
-                }
+        match *self {
+            FileOrValue::File { file: _, ref mut cache } => {
+                *cache = Some(val);
             }
 
             _ => {}
         }
 
-        error_vec.push(String::from("'auth' key expects an string, or table with the key 'secret' or keys 'signature' and 'key'"));
-
-        Err(error_vec)
+        Ok(())
     }
 
-    pub fn is_authority(&self) -> bool {
-        if let &Auth::Authority(_) = self {
-            return true;
-        }
+    pub fn get_value(&self) -> Result<Bytes, Error> {
+        match *self {
+            FileOrValue::Value { ref value } => {
+                Ok(Bytes::from(value.clone()))
+            }
 
-        false
-    }
+            FileOrValue::File { ref file, ref cache } => {
+                if let Some(ref cache) = cache {
+                    return Ok(cache.clone());
+                }
 
-    pub fn is_shared_secret(&self) -> bool {
-        if let &Auth::SharedSecret(_) = self {
-            return true;
-        }
-
-        false
-    }
-}
-
-
-
-#[derive(Debug, Clone)]
-pub struct Authority {
-    pub key: Bytes,
-    pub signature: Bytes,
-}
-
-#[derive(Clone)]
-pub struct SharedSecret {
-    pub secret: Bytes,
-}
-
-impl Debug for SharedSecret {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "SharedSecret {{ secret: {:?} }}", self.secret)
-    }
-}
-
-impl SharedSecret {
-    pub fn get_signing_key(&self) -> SigningKey {
-        SigningKey::new(&digest::SHA512, &self.secret)
-    }
-
-    pub fn new(secret: Bytes) -> SharedSecret {
-        SharedSecret {
-            secret,
+                let mut fd = File::open(file)?;
+                let mut contents = Vec::new();
+                fd.read_to_end(&mut contents)?;
+                let contents = Bytes::from(contents);
+                Ok(contents)
+            }
         }
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialOrd, PartialEq)]
-pub enum ChosenRouter {
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Config {
+    pub key: FileOrValue,
+    #[serde(skip)]
+    #[serde(default)]
+    public_key: Bytes,
+    #[serde(rename = "network-id")]
+    pub network_id: Vec<u8>,
+    #[serde(default)]
+    pub server: ServerConfig,
+    pub auth: AuthConfig,
+    #[serde(rename = "network")]
+    #[serde(default)]
+    pub networks: Vec<NetworkConfig>,
+    #[serde(default)]
+    pub interface: InterfaceConfig,
+    #[serde(default)]
+    pub router: RouterConfig,
+}
+
+impl Config {
+    pub fn get_public_key(&self) -> Bytes {
+        return self.public_key.clone()
+    }
+
+    pub fn get_key_pair(&self) -> Ed25519KeyPair {
+        Ed25519KeyPair::from_seed_unchecked(Input::from(&self.key.get_value().unwrap())).unwrap()
+    }
+
+    pub fn load(&mut self) -> Result<(), Error> {
+        self.public_key = Bytes::from(self.get_key_pair().public_key_bytes());
+        self.auth.load()?;
+        self.key.load()?;
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ServerConfig {
+    #[serde(default = "ServerConfig::default_threads")]
+    pub threads: u8
+}
+
+impl ServerConfig {
+    fn default_threads() -> u8 { 2 }
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        ServerConfig {
+            threads: ServerConfig::default_threads()
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum NetworkConfig {
+    #[serde(rename = "dns")]
+    DnsNetworkConfig(DnsNetworkConfig),
+    #[serde(rename = "peers")]
+    PeersNetworkConfig(PeersNetworkConfig),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DnsNetworkConfig {
+    pub domain: String
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PeersNetworkConfig {
+    #[serde(default)]
+    pub peers: Vec<SocketAddr>
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InterfaceConfig {
+    #[serde(default = "InterfaceConfig::default_mode")]
+    pub mode: InterfaceConfigMode,
+    #[serde(default = "InterfaceConfig::default_name")]
+    pub name: String,
+    #[serde(default = "InterfaceConfig::default_mtu")]
+    pub mtu: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Ord, PartialOrd, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum InterfaceConfigMode {
+    Tap,
+    Tun,
+}
+
+impl From<InterfaceConfigMode> for Mode {
+    fn from(mode: InterfaceConfigMode) -> Self {
+        match mode {
+            InterfaceConfigMode::Tap => Mode::Tap,
+            InterfaceConfigMode::Tun => Mode::Tun,
+        }
+    }
+}
+
+impl InterfaceConfig {
+    fn default_name() -> String { "bw%d".to_string() }
+    fn default_mtu() -> u32 { 1400 }
+    fn default_mode() -> InterfaceConfigMode { InterfaceConfigMode::Tap }
+}
+
+impl Default for InterfaceConfig {
+    fn default() -> Self {
+        InterfaceConfig {
+            mode: InterfaceConfig::default_mode(),
+            name: InterfaceConfig::default_name(),
+            mtu: InterfaceConfig::default_mtu(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum AuthConfig {
+    SharedSecretConfig(SharedSecretConfig),
+    CertificateAuthorityConfig(CertificateAuthorityConfig),
+}
+
+impl AuthConfig {
+    pub fn load(&mut self) -> Result<(), Error> {
+        match self {
+            AuthConfig::CertificateAuthorityConfig(ref mut c) => c.load()?,
+            _ => {}
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CertificateAuthorityConfig {
+    pub signature: FileOrValue,
+    pub ca: FileOrValue,
+}
+
+impl CertificateAuthorityConfig {
+    pub fn load(&mut self) -> Result<(), Error> {
+        self.signature.load()?;
+        self.ca.load()?;
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SharedSecretConfig {
+    pub secret: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RouterConfig {
+    #[serde(default = "RouterConfig::default_name")]
+    pub name: RouterChoice,
+    #[cfg(feature = "python-router")]
+    #[serde(default = "RouterConfig::default_python")]
+    pub python: Option<PythonRouterConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RouterChoice {
     Dumb,
     #[cfg(feature = "python-router")]
     Python,
 }
 
-static MAP: &'static [(&'static str, ChosenRouter)] = &[
-    ("dumb", ChosenRouter::Dumb),
-        #[cfg(feature = "python-router")]
-    ("python", ChosenRouter::Python),
-];
-
-impl ChosenRouter {
-    fn get_map() -> &'static [(&'static str, ChosenRouter)] {
-        &MAP
-    }
-
-    fn as_str(&self) -> &'static str {
-        for (name, token) in ChosenRouter::get_map() {
-            if *token == *self {
-                return *name;
-            }
-        }
-
-        "dumb"
-    }
-
-    fn from_str(s: String) -> Option<Self> {
-        for (name, token) in ChosenRouter::get_map() {
-            if *name == s {
-                return Some(*token);
-            }
-        }
-
-        None
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Interface {
-    pub name: String,
-    pub mode: Mode,
-    pub mtu: u16,
-}
-
-impl Interface {
-    pub fn from_value(value: &Value) -> Result<Interface, Vec<String>> {
-        if let &Value::Table(ref table) = value {
-            let mut name = String::from("bw%d");
-            let mut mode = Mode::Tun;
-            let mut mtu = 1400;
-
-            if let Some(&Value::String(ref config_name)) = table.get("name") {
-                name = config_name.clone();
-            }
-
-            if let Some(&Value::String(ref config_mode)) = table.get("mode") {
-                let config_mode = config_mode.clone();
-
-                match config_mode.as_str() {
-                    "tun" => {
-                        mode = Mode::Tun;
-                    }
-
-                    "tap" => {
-                        mode = Mode::Tap;
-                    }
-
-                    x => {
-                        return Err(vec![format!("interface.mode should be 'tun' or 'tap'; '{}' given", x)])
-                    }
-                }
-            }
-
-            if let Some(&Value::Integer(ref number)) = table.get("mtu") {
-                if *number > 65535 || *number <= 0 {
-                    return Err(vec![format!("interface.mtu should be between 0 and 65535; '{}' given", *number)])
-                }
-
-                mtu = *number as u16;
-            }
-
-            Ok(Interface {
-                mtu,
-                name,
-                mode
-            })
-        } else {
-            Err(vec!["interface should be a table with the keys name, mode and mtu".to_string()])
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct RouterConfig {
-    pub name: ChosenRouter,
-    #[cfg(feature = "python-router")]
-    pub python: Option<PythonRouterConfig>,
-}
-
 impl RouterConfig {
-    pub fn from_value(value: &Value) -> Result<RouterConfig, Vec<String>> {
-        if let &Value::Table(ref table) = value {
-            if let Some(&Value::String(ref name)) = table.get("name") {
-                if let Some(token) = ChosenRouter::from_str(name.clone()) {
-                    return match token {
-                        ChosenRouter::Dumb => {
-                            Ok(RouterConfig {
-                                name: ChosenRouter::Dumb,
-                                #[cfg(feature = "python-router")]
-                                python: None,
-                            })
-                        }
+    fn default_name() -> RouterChoice { RouterChoice::Dumb }
+    #[cfg(feature = "python-router")]
+    fn default_python() -> Option<PythonRouterConfig> { None }
+}
 
-                        #[cfg(feature = "python-router")]
-                        ChosenRouter::Python => {
-                            return Ok(RouterConfig {
-                                name: ChosenRouter::Python,
-                                python: Some(PythonRouterConfig::from_value(table.get("python").unwrap_or_else(|| &Value::Boolean(false)))?),
-                            });
-                        }
-                    };
-                } else {
-                    return Err(vec![format!("router.name should be one of: {}", ChosenRouter::get_map().iter().fold("".to_string(), |acc, x| {
-                        if acc.len() == 0 {
-                            x.1.as_str().to_string()
-                        } else {
-                            format!("{}, {}", acc, x.1.as_str().to_string())
-                        }
-                    }))]);
-                }
-            }
+impl Default for RouterConfig {
+    fn default() -> Self {
+        RouterConfig {
+            name: RouterConfig::default_name(),
+            #[cfg(feature = "python-router")]
+            python: None,
         }
-
-        Err(vec!["router should be a table with the key 'name'".to_string()])
     }
 }
 
 #[cfg(feature = "python-router")]
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PythonRouterConfig {
-    pub script: String
+    pub script: String,
 }
 
-#[cfg(feature = "python-router")]
-impl PythonRouterConfig {
-    pub fn from_value(value: &Value) -> Result<PythonRouterConfig, Vec<String>> {
-        match value {
-            &Value::Table(ref table) => {
-                if let Some(&Value::String(ref script)) = table.get("script") {
-                    return Ok(PythonRouterConfig {
-                        script: script.to_string(),
-                    });
-                }
-            }
+#[cfg(test)]
+mod test {
+    use toml;
+    use super::Config;
 
-            &Value::String(ref script) => {
-                return Ok(PythonRouterConfig {
-                    script: script.to_string(),
-                });
-            }
+    #[test]
+    fn test_parsing() {
+        let config: Config = toml::from_str(r#"
+key = { file = "12345678901234567890123456789012" }
 
-            _ => {}
-        }
+[server]
+threads = 4
 
-        Err(vec!["router.python needs to be a string or a table with the key 'script' pointing to the python router script".to_string()])
-    }
-}
-#[derive(Clone)]
-pub struct Identity {
-    pub key: Bytes,
-    pub name: Option<String>,
-    pub public_key: Bytes,
-}
+[[network]]
+type = "dns"
+domain = "zer.ooo"
 
-impl Debug for Identity {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "Identity {{ public_key: {:?}, name: {:?} }}", self.public_key, self.name)
-    }
-}
+[[network]]
+type = "peers"
+peers = [
+  "1.2.3.4:124"
+]
 
-impl Identity {
-    pub fn get_key_pair(&self) -> Ed25519KeyPair {
-        Ed25519KeyPair::from_seed_unchecked(Input::from(&self.key.clone())).unwrap()
-    }
+[interface]
+mtu = 1400
+name = "bw%d"
+mode = "tap"
 
-    pub fn sign(&self, msg: &[u8]) -> Bytes {
-        return Bytes::from(self.get_key_pair().sign(msg).as_ref());
-    }
+[auth]
+secret = "help"
 
-    pub fn from_value(value: &Value) -> Result<Identity, Vec<String>> {
-        let mut error_vec = vec![];
+[router]
+name = "dumb"
 
-        match value {
-            &Value::Table(ref table) => {
-                let mut has_errors = false;
-                let mut key: Bytes = Bytes::new();
-                let mut name: Option<String> = None;
-
-                if table.contains_key("key") {
-                    let n = &table["key"];
-
-                    match parse_file_or_value(n, "identity.key", true) {
-                        Ok(key_b) => {
-                            key = key_b
-                        }
-
-                        Err(err) => {
-                            error_vec.extend(err);
-                            has_errors = true;
-                        }
-                    }
-                } else {
-                    error_vec.push(String::from("'identity' is missing value 'key'"));
-                    has_errors = true;
-                }
-
-                if table.contains_key("name") {
-                    let n = &table["name"];
-
-                    if let &Value::String(ref string) = n {
-                        name = Some(string.clone());
-                    } else {
-                        error_vec.push(String::from("'identity.name' should be a string, ignoring value"));
-                    }
-                }
-
-                if !has_errors {
-                    let key_pair = Ed25519KeyPair::from_seed_unchecked(Input::from(&key.clone())).unwrap();
-
-                    return Ok(Identity {
-                        name,
-                        key,
-                        public_key: Bytes::from(key_pair.public_key_bytes()),
-                    });
-                }
-            }
-
-            _ => {
-                error_vec.push(String::from("'identity' key expects a table with at least the key 'key' and optionally 'name'"));
-            }
-        }
-
-        Err(error_vec)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct ServerConfig {
-    pub threads: u16
-}
-
-impl ServerConfig {
-    pub fn from_value(value: &Value) -> Result<ServerConfig, Vec<String>> {
-        match value {
-            &Value::Table(ref table) => {
-                let mut threads = 2;
-
-                if let Some(&Value::Integer(ref num)) = table.get("threads") {
-                    let num = *num;
-
-                    if num < 1 || num > 65535 {
-                        return Err(vec!["server.threads needs to be between 1 and 65535".to_string()])
-                    }
-
-                    threads = num as u16;
-                }
-
-                Ok(ServerConfig {
-                    threads
-                })
-            }
-
-            _ => {
-                Err(vec!["server needs to be a table with the key threads".to_string()])
-            }
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct Network {
-    pub id: [u8; 20],
-    pub code: Option<String>,
-}
-
-impl Network {
-    pub fn from_value(value: &Value) -> Result<Network, Vec<String>> {
-        let mut error_vec = vec![];
-
-        match value {
-            &Value::Table(ref table) => {
-                if table.contains_key("id") {
-                    if let &Value::String(ref id_str) = &table["id"] {
-                        let id_str = id_str.as_str();
-
-                        if id_str.len() == 40 && id_str.chars().all(|char| char.is_ascii_hexdigit()) {
-                            let mut network_id: [u8; 20] = [0; 20];
-
-                            for i in 0..20 {
-                                let offset = i * 2;
-                                network_id[i] = u8::from_str_radix(&id_str[offset..offset + 2], 16).unwrap();
-                            }
-
-                            return Ok(Network {
-                                id: network_id,
-                                code: None,
-                            });
-                        }
-                    }
-
-                    error_vec.push(String::from("'network.id' key needs to be a 40 letter long hexadecimal string"));
-                    return Err(error_vec);
-                }
-
-                if table.contains_key("code") {
-                    if let &Value::String(ref code_str) = &table["code"] {
-                        let digestion = digest::digest(&digest::SHA1, &code_str.clone().into_bytes());
-                        let mut network_id: [u8; 20] = [0; 20];
-                        network_id.copy_from_slice(&digestion.as_ref()[..20]);
-
-                        return Ok(Network {
-                            id: network_id,
-                            code: Some(code_str.clone()),
-                        });
-                    }
-
-                    error_vec.push(String::from("'network.code' key needs to be a string"));
-                    return Err(error_vec);
-                }
-            }
-
-            _ => {
-                error_vec.push(String::from("'network' key expects a table with the key 'code' or 'id'"));
-            }
-        }
-
-        Err(error_vec)
-    }
-}
-
-impl Debug for Network {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        let id = &self.id[..];
-        let mut hex_string = String::with_capacity(40);
-        let hex = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"];
-
-        for byte in id {
-            hex_string.push_str(hex[((byte >> 4) & 15 as u8) as usize]);
-            hex_string.push_str(hex[(byte & 15) as usize]);
-        }
-
-        write!(f, "Network {{ id: {}, code: {:?} }}", hex_string, self.code)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Config {
-    pub identity: Identity,
-    pub interface: Interface,
-    pub server: ServerConfig,
-    pub auth: Auth,
-    pub network: Network,
-    pub router: RouterConfig,
-}
-
-impl Config {
-    pub fn from_value(value: &Value) -> Result<Config, Vec<String>> {
-        let mut error_vec = vec![];
-
-        match value {
-            &Value::Table(ref table) => {
-                let mut auth: Option<Auth> = None;
-                let mut identity: Option<Identity> = None;
-                let mut network: Option<Network> = None;
-                let mut router: RouterConfig = RouterConfig {
-                    name: ChosenRouter::Dumb,
-                    #[cfg(feature = "python-router")]
-                    python: None,
-                };
-
-                let mut interface = Interface {
-                    mtu: 1400,
-                    mode: Mode::Tun,
-                    name: "bw%d".to_string()
-                };
-
-                let mut server = ServerConfig {
-                    threads: 4,
-                };
-
-                let mut has_errors: bool = false;
-                if table.contains_key("auth") {
-                    match Auth::from_value(&table["auth"]) {
-                        Ok(auth_) => {
-                            auth = Some(auth_);
-                        }
-
-                        Err(err) => {
-                            error_vec.extend(err);
-                            has_errors = true;
-                        }
-                    }
-                } else {
-                    has_errors = true;
-                    error_vec.push(String::from("Config is missing 'auth' key"));
-                }
-
-                if table.contains_key("interface") {
-                    match Interface::from_value(&table["interface"]) {
-                        Ok(interf) => {
-                            interface = interf;
-                        }
-
-                        Err(err) => {
-                            error_vec.extend(err);
-                            has_errors = true;
-                        }
-                    }
-                }
-
-                if table.contains_key("server") {
-                    match ServerConfig::from_value(&table["server"]) {
-                        Ok(serv) => {
-                            server = serv;
-                        }
-
-                        Err(err) => {
-                            error_vec.extend(err);
-                            has_errors = true;
-                        }
-                    }
-                }
-
-                if table.contains_key("identity") {
-                    match Identity::from_value(&table["identity"]) {
-                        Ok(ident) => {
-                            identity = Some(ident);
-                        }
-
-                        Err(err) => {
-                            error_vec.extend(err);
-                            has_errors = true;
-                        }
-                    }
-                } else {
-                    has_errors = true;
-                    error_vec.push(String::from("Config is missing 'identity' key"));
-                }
-
-                if table.contains_key("network") {
-                    match Network::from_value(&table["network"]) {
-                        Ok(net) => {
-                            network = Some(net);
-                        }
-
-                        Err(err) => {
-                            error_vec.extend(err);
-                            has_errors = true;
-                        }
-                    }
-                } else {
-                    has_errors = true;
-                    error_vec.push(String::from("Config is missing 'network' key"));
-                }
-
-                if let Some(ref value) = table.get("router") {
-                    match RouterConfig::from_value(value) {
-                        Ok(rou) => router = rou,
-                        Err(err) => {
-                            error_vec.extend(err);
-                            has_errors = true;
-                        }
-                    }
-                }
-
-                if !has_errors {
-                    return Ok(Config {
-                        router,
-                        interface,
-                        server,
-                        auth: auth.unwrap(),
-                        identity: identity.unwrap(),
-                        network: network.unwrap(),
-                    });
-                }
-            }
-
-            _ => {
-                error_vec.push(String::from("Config must be a table."));
-            }
-        }
-
-        Err(error_vec)
+    [router.python]
+    script = "python/example_router.py"
+"#).unwrap();
+        assert_eq!(config.networks.len(), 2);
+        assert_eq!(config.server.threads, 4);
     }
 }

@@ -66,6 +66,8 @@ Options:
     -h, --help  Display this help
 ";
 
+const DEFAULT_CONFIG: &'static str = "/etc/bw/config.toml";
+
 #[derive(Deserialize)]
 struct Args {
     arg_config: Option<String>,
@@ -88,14 +90,14 @@ fn main() {
     }
 
     if args.cmd_daemon {
-        let config = get_config(&args.arg_config.clone().unwrap_or("config/example_secret.toml".to_string())).unwrap();
+        let config = get_config(&args.arg_config.clone().unwrap_or(DEFAULT_CONFIG.to_string())).unwrap();
         run_daemon(config);
 
         return;
     }
 
     if args.cmd_display_config {
-        let config = get_config(&args.arg_config.clone().unwrap_or("config/example_secret.toml".to_string())).unwrap();
+        let config = get_config(&args.arg_config.clone().unwrap_or(DEFAULT_CONFIG.to_string())).unwrap();
         println!("{:#?}", config);
 
         return;
@@ -108,10 +110,10 @@ fn main() {
 
 fn run_daemon(config: Config) {
     let iface = {
-        if config.interface.mode == Mode::Tun {
-            Iface::new(config.interface.name.as_str(), config.interface.mode).unwrap()
+        if config.interface.mode == InterfaceConfigMode::Tun {
+            Iface::new(config.interface.name.as_str(), Mode::from(config.interface.mode.clone())).unwrap()
         } else {
-            Iface::without_packet_info(config.interface.name.as_str(), config.interface.mode).unwrap()
+            Iface::without_packet_info(config.interface.name.as_str(), Mode::from(config.interface.mode.clone())).unwrap()
         }
     };
 
@@ -253,11 +255,11 @@ fn get_config(path: &str) -> Result<Config, Vec<String>> {
 
     config.read_to_string(&mut contents).unwrap();
 
-    if let Ok(value) = contents.parse::<toml::Value>() {
-        return Config::from_value(&value);
-    } else {
-        return Err(vec![String::from("Failed to load config")]);
-    }
+    let mut config: Config = toml::from_str(&contents).unwrap();
+
+    config.load().unwrap();
+
+    Ok(config)
 }
 
 fn spawn_named<F, T>(name: &str, f: F) -> JoinHandle<T>

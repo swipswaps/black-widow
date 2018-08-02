@@ -308,7 +308,7 @@ impl RouterUnawareServer {
         let router = config.router.name.clone();
 
         match router {
-            ChosenRouter::Dumb => {
+            RouterChoice::Dumb => {
                 RouterUnawareServer::DumbRouter(Server::new(config))
             }
 
@@ -654,7 +654,7 @@ impl<R> ServerLike for Server<R>
         self.router.ready(ServerRemote {
             sender: self.sender.clone(),
             connections: self.connections.clone(),
-        }, self.config.identity.public_key.clone());
+        }, Bytes::from(self.config.key.get_value().unwrap()));
     }
 
     fn set_interface_name(&mut self, interface_name: String) {
