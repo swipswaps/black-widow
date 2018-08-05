@@ -98,7 +98,7 @@ fn main() {
 
     if args.cmd_display_config {
         let config = get_config(&args.arg_config.clone().unwrap_or(DEFAULT_CONFIG.to_string())).unwrap();
-        println!("{:#?}", config);
+        println!("{}", toml::to_string(&toml::Value::try_from(&config).unwrap()).unwrap());
 
         return;
     }

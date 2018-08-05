@@ -22,7 +22,10 @@ pub enum FileOrValue {
         cache: Option<Bytes>,
     },
     Value {
-        value: Vec<u8>,
+        value: String,
+        #[serde(default)]
+        #[serde(skip)]
+        cache: Option<Bytes>,
     },
 }
 
@@ -35,7 +38,9 @@ impl FileOrValue {
                 *cache = Some(val);
             }
 
-            _ => {}
+            FileOrValue::Value { value: _, ref mut cache } => {
+                *cache = Some(val);
+            }
         }
 
         Ok(())
@@ -43,8 +48,12 @@ impl FileOrValue {
 
     pub fn get_value(&self) -> Result<Bytes, Error> {
         match *self {
-            FileOrValue::Value { ref value } => {
-                Ok(Bytes::from(value.clone()))
+            FileOrValue::Value { ref value, ref cache } => {
+                Ok(if let Some(ref cache) = cache {
+                    cache.clone()
+                } else {
+                    Bytes::from(value.clone().into_bytes())
+                })
             }
 
             FileOrValue::File { ref file, ref cache } => {
@@ -68,8 +77,11 @@ pub struct Config {
     #[serde(skip)]
     #[serde(default)]
     public_key: Bytes,
+    #[serde(default)]
+    #[serde(skip)]
+    cached_network_id: Option<Bytes>,
     #[serde(rename = "network-id")]
-    pub network_id: Vec<u8>,
+    pub network_id: String,
     #[serde(default)]
     pub server: ServerConfig,
     pub auth: AuthConfig,
@@ -93,10 +105,19 @@ impl Config {
 
     pub fn load(&mut self) -> Result<(), Error> {
         self.public_key = Bytes::from(self.get_key_pair().public_key_bytes());
+        self.cached_network_id = Some(self.get_network_id());
         self.auth.load()?;
         self.key.load()?;
 
         Ok(())
+    }
+
+    pub fn get_network_id(&self) -> Bytes {
+        if let Some(ref cache) = self.cached_network_id {
+            cache.clone()
+        } else {
+            Bytes::from(self.network_id.clone().into_bytes())
+        }
     }
 }
 
@@ -191,7 +212,7 @@ impl AuthConfig {
     pub fn load(&mut self) -> Result<(), Error> {
         match self {
             AuthConfig::CertificateAuthorityConfig(ref mut c) => c.load()?,
-            _ => {}
+            AuthConfig::SharedSecretConfig(ref mut c) => c.load()?,
         }
 
         Ok(())
@@ -215,7 +236,25 @@ impl CertificateAuthorityConfig {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SharedSecretConfig {
-    pub secret: Vec<u8>,
+    #[serde(skip, default)]
+    cache: Option<Bytes>,
+    pub secret: String,
+}
+
+impl SharedSecretConfig {
+    pub fn load(&mut self) -> Result<(), Error> {
+        self.cache = Some(self.get_secret());
+
+        Ok(())
+    }
+
+    pub fn get_secret(&self) -> Bytes {
+        if let Some(ref cache) = self.cache {
+            cache.clone()
+        } else {
+            Bytes::from(self.secret.clone().into_bytes())
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -404,7 +404,7 @@ impl KeyExchange {
                     return false;
                 }
 
-                if let Err(_) = verify_with_own_key(&SigningKey::new(&SHA512, &secret.secret), &self.ephemeral_key, &self.proof) {
+                if let Err(_) = verify_with_own_key(&SigningKey::new(&SHA512, &secret.get_secret()), &self.ephemeral_key, &self.proof) {
                     return false;
                 }
             }
@@ -422,7 +422,7 @@ impl KeyExchange {
             Input::from(&self.ephemeral_key),
             Unspecified,
             |key_material| {
-                extract_and_expand(&SigningKey::new(&SHA512, &[0; 64]), key_material, &config.network_id, &mut out);
+                extract_and_expand(&SigningKey::new(&SHA512, &[0; 64]), key_material, &config.get_network_id(), &mut out);
 
                 Ok(())
             },
@@ -458,7 +458,7 @@ impl KeyExchange {
                 proof: {
                     match &config.auth {
                         &AuthConfig::SharedSecretConfig(ref secret) => {
-                            Bytes::from(sign(&SigningKey::new(&SHA512, &secret.secret), &ephemeral_public_key).as_ref())
+                            Bytes::from(sign(&SigningKey::new(&SHA512, &secret.get_secret()), &ephemeral_public_key).as_ref())
                         }
 
                         &AuthConfig::CertificateAuthorityConfig(ref auth) => {
