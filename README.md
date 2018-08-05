@@ -78,7 +78,10 @@ Currently this project works™, but is still looking at the following challenge
 
 # License
 
-*TODO: Add a license (preferably GPLv3 :D)*
 ```
     Copyright (c) 2018 eater and contributors
+    Licensed under the MIT License. For more information, see LICENSE.
+
+    Please note that the project will relicense to GPL (if all contributors still agree)
+    if there are no more GPL-incompatible dependencies.
 ```
