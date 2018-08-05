@@ -8,13 +8,12 @@ extern crate untrusted;
 extern crate uuid;
 extern crate crypto;
 extern crate futures;
-extern crate multiqueue;
 
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
 extern crate docopt;
-
+extern crate crossbeam_channel;
 
 #[cfg_attr(test, macro_use)]
 extern crate toml;
@@ -30,6 +29,7 @@ use nix::sys::signal;
 
 #[macro_use]
 pub mod bw;
+
 use docopt::Docopt;
 
 use bw::prelude::*;
@@ -38,21 +38,22 @@ use bw::router::use_python;
 
 use tun_tap::{Iface, Mode};
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::fs::File;
-use std::time::Duration;
-use std::thread::{Builder, sleep, JoinHandle};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket, Shutdown};
+use std::os::unix::net::{UnixStream, UnixListener};
+use std::path::Path;
+use std::fs::{File, remove_file};
+use std::thread::{Builder, JoinHandle, spawn};
 use std::sync::Arc;
-use std::sync::mpsc::channel;
+use std::sync::mpsc;
 use std::io::prelude::*;
-use std::io::stdin;
+use std::io::{stdin, BufReader};
 #[cfg(feature = "python-router")]
 use std::process::exit;
 use std::process::Command;
 
 use bytes::Bytes;
 
-use multiqueue::mpmc_queue;
+use crossbeam_channel as channel;
 
 const USAGE: &'static str = "
 bw - Black Widow
@@ -76,7 +77,6 @@ struct Args {
 }
 
 fn main() {
-
     let args: Args = Docopt::new(USAGE)
         .and_then(|d| d.argv(std::env::args().into_iter()).deserialize())
         .unwrap_or_else(|e| e.exit());
@@ -107,7 +107,6 @@ fn main() {
 }
 
 
-
 fn run_daemon(config: Config) {
     let iface = {
         if config.interface.mode == InterfaceConfigMode::Tun {
@@ -125,12 +124,12 @@ fn run_daemon(config: Config) {
     println!("Listening on {:?}", socket.local_addr().unwrap());
 
 
-    let (all_sender, all_receiver) = channel();
-    let (server_sender, server_receiver) = mpmc_queue::<ServerEvent>(1000);
+    let (all_sender, all_receiver) = mpsc::channel();
+    let (server_sender, server_receiver) = channel::bounded::<ServerEvent>(1000);
 
     let thread_cnt = config.server.threads;
 
-    let mut server = RouterUnawareServer::new(config);
+    let mut server = RouterUnawareServer::new(config.clone());
     server.set_interface_name(name.to_string());
 
     let all_writer = all_sender.clone();
@@ -149,7 +148,7 @@ fn run_daemon(config: Config) {
 
         loop {
             if let Ok(size) = iface_reader.recv(&mut x) {
-                server_writer.try_send(ServerEvent::Tunnel(Bytes::from(&x[..size]))).unwrap();
+                server_writer.send(ServerEvent::Tunnel(Bytes::from(&x[..size])));
             }
         }
     });
@@ -159,12 +158,14 @@ fn run_daemon(config: Config) {
     let udp_writer = Arc::clone(&udp);
     let server_writer = server_sender.clone();
 
+    unix_listener(&config, server.clone());
+
     let udp_reader = spawn_named("udp listener", move || {
         let mut x = vec![0u8; 1500];
 
         loop {
             if let Ok((size, from)) = udp_reader.recv_from(&mut x) {
-                server_writer.try_send(ServerEvent::Packet(Bytes::from(&x[..size]), from)).unwrap();
+                server_writer.send(ServerEvent::Packet(Bytes::from(&x[..size]), from));
             }
         }
     });
@@ -174,27 +175,25 @@ fn run_daemon(config: Config) {
         let mut input = String::new();
         loop {
             if let Ok(size) = stdin().read_line(&mut input) {
-                server_writer.try_send(ServerEvent::Control(input[..size].to_string())).unwrap();
+                server_writer.send(ServerEvent::Control(input[..size].to_string()));
                 input = String::new();
             }
         }
     });
 
     let all_reader = spawn_named("server event listener", move || {
-        loop {
-            if let Ok(event) = all_receiver.recv() {
-                match event {
-                    ServerEvent::Packet(data, addr) => {
-                        udp_writer.send_to(data.as_ref(), addr).unwrap();
-                    }
+        while let Ok(event) = all_receiver.recv() {
+            match event {
+                ServerEvent::Packet(data, addr) => {
+                    udp_writer.send_to(data.as_ref(), addr).unwrap();
+                }
 
-                    ServerEvent::Tunnel(data) => {
-                        iface_writer.send(data.as_ref()).unwrap();
-                    }
+                ServerEvent::Tunnel(data) => {
+                    iface_writer.send(data.as_ref()).unwrap();
+                }
 
-                    ServerEvent::Control(data) => {
-                        println!("{}", data);
-                    }
+                ServerEvent::Control(data) => {
+                    println!("{}", data);
                 }
             }
         }
@@ -209,17 +208,11 @@ fn run_daemon(config: Config) {
         let serv_recv = server_receiver.clone();
         let server_clone = server.clone();
         threads.push(spawn_named(&format!("server digestion {}", i), move || {
-            loop {
-                if let Ok(event) = serv_recv.recv() {
-                    server_clone.send_event(event);
-                } else {
-                    sleep(Duration::from_micros(100));
-                }
+            while let Some(event) = serv_recv.recv() {
+                server_clone.send_event(event);
             }
         }));
     }
-
-    server_receiver.unsubscribe();
 
     for thread in threads {
         thread.join().unwrap();
@@ -237,6 +230,54 @@ extern fn handle_sigint(_: i32) {
     use_python(|| {
         exit(0)
     })
+}
+
+fn unix_listener(config: &Config, server: RouterUnawareServer) {
+    if None == config.server.unix_socket {
+        return;
+    }
+
+    let config = config.clone();
+    let path = config.server.unix_socket.unwrap();
+
+    if Path::new(&path).exists() {
+        remove_file(&path).unwrap();
+    }
+
+    let socket = UnixListener::bind(&path).unwrap();
+
+    spawn_named("unix listener", move || {
+        for stream in socket.incoming() {
+            match stream {
+                Ok(stream) => {
+                    let server_clone = server.clone();
+                    spawn(|| handle_client(stream, server_clone));
+                }
+                Err(_) => {
+                    break;
+                }
+            }
+        }
+    });
+
+    fn handle_client(mut stream: UnixStream, server: RouterUnawareServer) {
+        loop {
+            let input = {
+                let mut input = String::new();
+                let mut reader = BufReader::new(&stream);
+                if let Ok(size) = reader.read_line(&mut input) {
+                    input[..size].to_string()
+                } else {
+                    break;
+                }
+            };
+
+            let output = format!("{}\n", server.handle_control(input));
+            &stream.write(&output.into_bytes());
+        }
+
+        stream.shutdown(Shutdown::Both).unwrap();
+    }
 }
 
 fn cmd(cmd: &str, args: &[&str]) {

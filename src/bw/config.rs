@@ -124,7 +124,9 @@ impl Config {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ServerConfig {
     #[serde(default = "ServerConfig::default_threads")]
-    pub threads: u8
+    pub threads: u8,
+    #[serde(default, rename = "unix-socket")]
+    pub unix_socket: Option<String>,
 }
 
 impl ServerConfig {
@@ -134,7 +136,8 @@ impl ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
-            threads: ServerConfig::default_threads()
+            threads: ServerConfig::default_threads(),
+            unix_socket: None,
         }
     }
 }

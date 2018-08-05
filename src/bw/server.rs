@@ -348,6 +348,12 @@ impl ServerLike for RouterUnawareServer {
         })
     }
 
+    fn handle_control(&self, data: String) -> String {
+        router_unaware_action!( self, router => {
+            router.handle_control(data)
+        })
+    }
+
     fn set_sender(&mut self, sender: Sender<ServerEvent>) {
         router_unaware_action!( self, router => {
             router.set_sender(sender);
@@ -417,6 +423,7 @@ pub trait ServerLike {
     fn set_interface_name(&mut self, interface_name: String);
     fn set_sender(&mut self, sender: Sender<ServerEvent>);
     fn send_event(&self, event: ServerEvent);
+    fn handle_control(&self, data: String) -> String;
 }
 
 impl Server<DumbRouter> {
@@ -604,20 +611,7 @@ impl<R> Server<R>
     }
 
     fn on_control(&self, data: String) {
-        if data.starts_with("connect ") {
-            let try = data[8..].trim();
-
-            if let Ok(x) = try.parse::<SocketAddr>() {
-                self.connect(x);
-                self.queue_event(ServerEvent::Control(String::from("Ok")));
-            } else {
-                self.queue_event(ServerEvent::Control(String::from("Not a valid IP")));
-            }
-
-            return;
-        }
-
-        self.queue_event(ServerEvent::Control(String::from("Invalid input")))
+        self.queue_event(ServerEvent::Control(self.handle_control(data)));
     }
 }
 
@@ -668,5 +662,20 @@ impl<R> ServerLike for Server<R>
 
     fn set_sender(&mut self, sender: Sender<ServerEvent>) {
         self.sender = sender;
+    }
+
+    fn handle_control(&self, data: String) -> String {
+        if data.starts_with("connect ") {
+            let try = data[8..].trim();
+
+            if let Ok(x) = try.parse::<SocketAddr>() {
+                self.connect(x);
+                return String::from("Ok");
+            } else {
+                return String::from("Not a valid scoket address");
+            }
+        }
+
+        return String::from("Invalid input");
     }
 }
