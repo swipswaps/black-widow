@@ -11,20 +11,17 @@ use std::io::{Error, Read};
 use std::fs::File;
 
 
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum FileOrValue {
     File {
         file: String,
-        #[serde(default)]
-        #[serde(skip)]
+        #[serde(default, skip)]
         cache: Option<Bytes>,
     },
     Value {
         value: String,
-        #[serde(default)]
-        #[serde(skip)]
+        #[serde(default, skip)]
         cache: Option<Bytes>,
     },
 }
@@ -74,19 +71,16 @@ impl FileOrValue {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Config {
     pub key: FileOrValue,
-    #[serde(skip)]
-    #[serde(default)]
+    #[serde(skip, default)]
     public_key: Bytes,
-    #[serde(default)]
-    #[serde(skip)]
+    #[serde(default, skip)]
     cached_network_id: Option<Bytes>,
     #[serde(rename = "network-id")]
     pub network_id: String,
     #[serde(default)]
     pub server: ServerConfig,
     pub auth: AuthConfig,
-    #[serde(rename = "network")]
-    #[serde(default)]
+    #[serde(rename = "network", default)]
     pub networks: Vec<NetworkConfig>,
     #[serde(default)]
     pub interface: InterfaceConfig,
@@ -96,7 +90,7 @@ pub struct Config {
 
 impl Config {
     pub fn get_public_key(&self) -> Bytes {
-        return self.public_key.clone()
+        self.public_key.clone()
     }
 
     pub fn get_key_pair(&self) -> Ed25519KeyPair {
