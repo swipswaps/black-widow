@@ -27,6 +27,14 @@ pub enum FileOrValue {
 }
 
 impl FileOrValue {
+    #[allow(dead_code)]
+    pub fn with_value(data: Bytes) -> FileOrValue {
+        FileOrValue::File {
+            file: "/tmp/mem".to_string(),
+            cache: Some(data),
+        }
+    }
+
     pub fn load(&mut self) -> Result<(), Error> {
         let val = self.get_value()?;
 
@@ -302,6 +310,7 @@ mod test {
     fn test_parsing() {
         let config: Config = toml::from_str(r#"
 key = { file = "12345678901234567890123456789012" }
+network-id = "help"
 
 [server]
 threads = 4

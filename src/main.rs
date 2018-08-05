@@ -14,8 +14,6 @@ extern crate serde;
 extern crate serde_derive;
 extern crate docopt;
 extern crate crossbeam_channel;
-
-#[cfg_attr(test, macro_use)]
 extern crate toml;
 
 #[cfg(feature = "python-router")]
