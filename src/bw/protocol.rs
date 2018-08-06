@@ -172,7 +172,6 @@ fn chacha20(key: &[u8], iv: &[u8], cipher_text: &[u8]) -> Bytes {
 
 #[derive(Debug)]
 pub struct EncryptedMessage {
-    pub packet_id: u64,
     pub iv: Bytes,
     pub cipher_text: Bytes,
 }
@@ -184,9 +183,8 @@ impl EncryptedMessage {
         }
 
         Some(EncryptedMessage {
-            packet_id: BigEndian::read_u64(&data[0..8]),
-            iv: data.slice(8, 20),
-            cipher_text: data.slice_from(20),
+            iv: data.slice(0, 12),
+            cipher_text: data.slice_from(12),
         })
     }
 
@@ -195,6 +193,7 @@ impl EncryptedMessage {
         SystemRandom::new().fill(&mut iv).unwrap();
 
         let mut message_clone = message.clone();
+        message_clone.packet_id = packet_id;
         message_clone.sign(parameters);
 
         let mut plain_text = BytesMut::with_capacity(message_clone.size());
@@ -206,7 +205,6 @@ impl EncryptedMessage {
         EncryptedMessage {
             iv: Bytes::from(&iv[..]),
             cipher_text,
-            packet_id,
         }
     }
 
@@ -220,7 +218,7 @@ impl EncryptedMessage {
         )
     }
 
-    pub fn size(&self) -> usize { 20 + self.cipher_text.len() }
+    pub fn size(&self) -> usize { 12 + self.cipher_text.len() }
 
     pub fn to_bytes(&self, out: &mut [u8]) -> Option<usize> {
         if out.len() < self.size() {
@@ -228,7 +226,6 @@ impl EncryptedMessage {
         }
 
         let mut cursor = Cursor::new(out);
-        cursor.write_u64::<BigEndian>(self.packet_id).unwrap();
         cursor.write(&self.iv).unwrap();
         cursor.write(&self.cipher_text).unwrap();
 
@@ -239,6 +236,7 @@ impl EncryptedMessage {
 
 #[derive(Clone, Debug)]
 pub struct Message {
+    pub packet_id: u64,
     pub compressed: bool,
     pub message_type: u8,
     pub payload: Bytes,
@@ -248,6 +246,7 @@ pub struct Message {
 impl Message {
     pub fn new(message_type: u8, payload: Bytes) -> Message {
         Message {
+            packet_id: 0,
             compressed: false,
             message_type,
             payload,
@@ -258,27 +257,22 @@ impl Message {
     pub fn from_bytes(data: Bytes) -> Option<Message> {
         let hmac_start = data.len() - 20;
         let hmac = data.slice_from(hmac_start);
-        let payload = data.slice(1, hmac_start);
+        let payload = data.slice(9, hmac_start);
 
         Some(Message {
-            compressed: (data[0] & 128) == 128,
-            message_type: data[0] & 127,
+            packet_id: BigEndian::read_u64(&data[0..8]),
+            compressed: (data[8] & 128) == 128,
+            message_type: data[8] & 127,
             payload,
             hmac,
         })
     }
 
     pub fn verify(&self, parameters: &EncryptionParameters) -> bool {
-        if let Err(_) = verify_with_own_key(&parameters.signing_key(), &self.payload, &self.hmac) {
-            return false;
-        }
-
-        true
+        verify_with_own_key(&parameters.signing_key(), &self.payload, &self.hmac).is_ok()
     }
 
-    pub fn size(&self) -> usize {
-        return 21 + self.payload.len();
-    }
+    pub fn size(&self) -> usize { 29 + self.payload.len() }
 
     pub fn sign(&mut self, parameters: &EncryptionParameters) {
         self.hmac = Bytes::from(sign(&parameters.signing_key(), &self.payload).as_ref());
@@ -290,6 +284,7 @@ impl Message {
         }
 
         let mut cursor = Cursor::new(out);
+        cursor.write_u64::<BigEndian>(self.packet_id).unwrap();
         cursor.write_u8({ if self.compressed { 128 } else { 0 } } + (self.message_type as u8 & 127)).unwrap();
         cursor.write(&self.payload).unwrap();
         cursor.write(&self.hmac).unwrap();
@@ -315,9 +310,7 @@ pub struct KeyExchange {
 }
 
 impl KeyExchange {
-    pub fn size(&self) -> usize {
-        194
-    }
+    pub fn size(&self) -> usize { 194 }
 
     pub fn from_bytes(data: Bytes) -> Option<KeyExchange> {
         if data.len() < 194 || data[0] != 1 || data[129] > 1 {
@@ -515,7 +508,6 @@ mod test {
     "#);
 
 
-
         if let Err(errs) = config {
             println!("Failed: {:?}", errs);
             assert!(false);
@@ -571,6 +563,7 @@ mod test {
         let parameters = parameters.unwrap();
 
         let message = Message {
+            packet_id: 0,
             compressed: false,
             message_type: 0,
             payload: Bytes::from(b"Hello world!".to_vec()),
