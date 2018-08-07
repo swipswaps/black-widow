@@ -1,20 +1,21 @@
 #![cfg_attr(feature = "python-router", feature(use_extern_macros))]
 
-extern crate tun_tap;
+extern crate base64;
 extern crate bytes;
 extern crate byteorder;
-extern crate ring;
-extern crate untrusted;
-extern crate uuid;
+extern crate clap;
+extern crate crossbeam_channel;
 extern crate crypto;
 extern crate futures;
-
+extern crate ring;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
-extern crate docopt;
-extern crate crossbeam_channel;
+extern crate serde_json;
 extern crate toml;
+extern crate tun_tap;
+extern crate untrusted;
+extern crate uuid;
 
 #[cfg(feature = "python-router")]
 extern crate pyo3;
@@ -28,57 +29,68 @@ use nix::sys::signal;
 #[macro_use]
 pub mod bw;
 
-use docopt::Docopt;
-
 use bw::prelude::*;
 #[cfg(feature = "python-router")]
 use bw::router::use_python;
 
 use tun_tap::{Iface, Mode};
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket, Shutdown};
+use std::fs::{File, remove_file};
+use std::io::prelude::*;
+use std::io::{stdin, stdout, BufReader};
+use std::net::{SocketAddr, UdpSocket, Shutdown};
 use std::os::unix::net::{UnixStream, UnixListener};
 use std::path::Path;
-use std::fs::{File, remove_file};
-use std::thread::{Builder, JoinHandle, spawn};
+use std::process::Command;
+use std::process::exit;
 use std::sync::Arc;
 use std::sync::mpsc;
-use std::io::prelude::*;
-use std::io::{stdin, BufReader};
-#[cfg(feature = "python-router")]
-use std::process::exit;
-use std::process::Command;
+use std::thread::{Builder, JoinHandle, spawn};
+
 
 use bytes::Bytes;
-
+use clap::{Arg, App, SubCommand, ArgMatches};
 use crossbeam_channel as channel;
+use ring::signature::Ed25519KeyPair;
+use ring::rand::SystemRandom;
 
-const USAGE: &'static str = "
-bw - Black Widow
-
-Usage:
-    bw daemon [--config <config>]
-    bw display-config [--config <config>]
-    bw [options]
-
-Options:
-    -h, --help  Display this help
-";
-
-const DEFAULT_CONFIG: &'static str = "/etc/bw/config.toml";
-
-#[derive(Deserialize)]
-struct Args {
-    arg_config: Option<String>,
-    cmd_daemon: bool,
-    cmd_display_config: bool,
+pub fn get_clap_app<'a, 'b>() -> App<'a, 'b> {
+    App::new("bw")
+        .version("0.1")
+        .author("eater <=@eater.me>")
+        .about("A peer-to-peer VPN with spiders")
+        .arg(Arg::with_name("config")
+            .short("c")
+            .long("config")
+            .env("BW_CONFIG")
+            .value_name("config-file")
+            .help("Sets the config file to use")
+            .default_value("/etc/bw/config.toml")
+            .global(true)
+            .takes_value(true))
+        .subcommand(SubCommand::with_name("daemon")
+            .about("Runs the main vpn process"))
+        .subcommand(SubCommand::with_name("dump-config")
+            .about("Dump the config used by Black Widow")
+            .arg(Arg::with_name("toml")
+                .long("toml")
+                .help("Dump config in toml instead of JSON")))
+        .subcommand(SubCommand::with_name("genkey")
+            .about("Generate a key for Black Widow")
+            .arg(Arg::with_name("base64")
+                .short("b")
+                .long("base64")
+                .help("Write new key in base64"))
+            .arg(Arg::with_name("file")
+                .short("f")
+                .long("file")
+                .help("Write new key to file")
+                .takes_value(true)))
 }
 
 fn main() {
-    let args: Args = Docopt::new(USAGE)
-        .and_then(|d| d.argv(std::env::args().into_iter()).deserialize())
-        .unwrap_or_else(|e| e.exit());
-
+    let matches = get_clap_app()
+        .get_matches();
 
     #[cfg(feature = "python-router")] unsafe {
         let sig_action = signal::SigAction::new(signal::SigHandler::Handler(handle_sigint),
@@ -87,23 +99,47 @@ fn main() {
         signal::sigaction(signal::SIGINT, &sig_action).unwrap();
     }
 
-    if args.cmd_daemon {
-        let config = get_config(&args.arg_config.clone().unwrap_or(DEFAULT_CONFIG.to_string())).unwrap();
-        run_daemon(config);
-
-        return;
+    match matches.subcommand() {
+        ("daemon", Some(sub_m)) => main_daemon(sub_m),
+        ("dump-config", Some(sub_m)) => main_dump_config(sub_m),
+        ("genkey", Some(sub_m)) => main_genkey(sub_m),
+        _ => {
+            println!("No command given. see --help for more info");
+        }
     }
-
-    if args.cmd_display_config {
-        let config = get_config(&args.arg_config.clone().unwrap_or(DEFAULT_CONFIG.to_string())).unwrap();
-        println!("{}", toml::to_string(&toml::Value::try_from(&config).unwrap()).unwrap());
-
-        return;
-    }
-
-    println!("No command given. see --help for more info");
 }
 
+fn main_daemon(matches: &ArgMatches) {
+    let config_path = matches.value_of("config").unwrap();
+    let config = get_config(&config_path).unwrap();
+    run_daemon(config);
+}
+
+fn main_dump_config(matches: &ArgMatches) {
+    let config_path = matches.value_of("config").unwrap();
+    let config = get_config(&config_path).unwrap();
+
+    if matches.is_present("toml") {
+        println!("{}", toml::to_string(&toml::Value::try_from(&config).unwrap()).unwrap());
+    } else {
+        println!("{}", serde_json::to_string_pretty(&config).unwrap())
+    }
+}
+
+fn main_genkey(matches: &ArgMatches) {
+    let newkey = &Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap()[..];
+
+    let newkey = if matches.is_present("base64") { format!("{}\n", base64::encode(newkey)).into_bytes() } else { Vec::from(newkey) };
+
+    if ! matches.is_present("file") {
+        stdout().write(&newkey).unwrap();
+        stdout().flush().unwrap();
+    } else {
+        let mut key = File::create(matches.value_of("file").unwrap()).unwrap();
+        key.write(&newkey).unwrap();
+        key.flush().unwrap();
+    }
+}
 
 fn run_daemon(config: Config) {
     let iface = {
@@ -118,7 +154,7 @@ fn run_daemon(config: Config) {
 
     cmd("ip", &["link", "set", iface.name(), "mtu", format!("{}", config.interface.mtu).as_str()]);
 
-    let socket = UdpSocket::bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0)).unwrap();
+    let socket = UdpSocket::bind(&SocketAddr::new(config.server.ip, config.server.port)).unwrap();
     println!("Listening on {:?}", socket.local_addr().unwrap());
 
 
@@ -289,6 +325,11 @@ fn cmd(cmd: &str, args: &[&str]) {
 }
 
 fn get_config(path: &str) -> Result<Config, Vec<String>> {
+    if !Path::new(&path).exists() {
+        println!("No config found at {}", path);
+        exit(1);
+    }
+
     let mut config = File::open(path).unwrap();
     let mut contents = String::new();
 

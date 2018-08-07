@@ -6,10 +6,10 @@ use tun_tap::Mode;
 
 use untrusted::Input;
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, IpAddr, Ipv4Addr};
 use std::io::{Error, Read};
 use std::fs::File;
-
+use base64;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
@@ -57,7 +57,7 @@ impl FileOrValue {
                 Ok(if let Some(ref cache) = cache {
                     cache.clone()
                 } else {
-                    Bytes::from(value.clone().into_bytes())
+                    Bytes::from(base64::decode(value).unwrap())
                 })
             }
 
@@ -127,12 +127,18 @@ impl Config {
 pub struct ServerConfig {
     #[serde(default = "ServerConfig::default_threads")]
     pub threads: u8,
+    #[serde(default = "ServerConfig::default_port")]
+    pub port: u16,
+    #[serde(default = "ServerConfig::default_ip")]
+    pub ip: IpAddr,
     #[serde(default, rename = "unix-socket")]
     pub unix_socket: Option<String>,
 }
 
 impl ServerConfig {
     fn default_threads() -> u8 { 2 }
+    fn default_port() -> u16 { 0 }
+    fn default_ip() -> IpAddr { IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)) }
 }
 
 impl Default for ServerConfig {
@@ -140,6 +146,8 @@ impl Default for ServerConfig {
         ServerConfig {
             threads: ServerConfig::default_threads(),
             unix_socket: None,
+            ip: ServerConfig::default_ip(),
+            port: ServerConfig::default_port(),
         }
     }
 }
