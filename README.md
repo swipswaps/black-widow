@@ -1,6 +1,6 @@
 # Black Widow (`bw`)
 
-A Meshnet VPN on Layer 2.
+A peer-to-peer VPN with spiders
 
 🔥 **WARNING!** 🔥 This VPN, it's protocol and the used cryptography library has not
 received any formal or informal audit, use at your own risk.
